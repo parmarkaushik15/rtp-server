@@ -78,6 +78,40 @@ class RTPServer {
     return header;                             // Return the completed RTP header
   }
 
+  // Static method to create WAV writer (for use with existing file streams)
+  static createWAVWriter(filePath, sampleRate = 8000, channels = 1, bitDepth = 16) {
+    const fileStream = fs.createWriteStream(filePath);
+    const wavWriter = new wav.Writer({
+      channels: channels,
+      sampleRate: sampleRate,
+      bitDepth: bitDepth
+    });
+    wavWriter.pipe(fileStream);
+    return { writeStream: wavWriter, fileStream: fileStream };
+  }
+
+  // Static method to convert μ-law buffer to PCM (for use without creating instance)
+  static convertMuLawToPCM(muBuffer) {
+    const numSamples = muBuffer.length;
+    const pcmBuffer = Buffer.alloc(numSamples * 2);
+    for (let i = 0; i < numSamples; i++) {
+      const mu = muBuffer[i];
+      const linear = RTPServer.muLawToLinearStatic(mu);
+      pcmBuffer.writeInt16LE(linear, i * 2);
+    }
+    return pcmBuffer;
+  }
+
+  // Static version of muLawToLinear for use without instance
+  static muLawToLinearStatic(mu) {
+    mu = ~mu & 0xFF;
+    const sign = (mu & 0x80) ? -1 : 1;
+    const exponent = (mu >> 4) & 0x07;
+    const mantissa = mu & 0x0F;
+    const sample = sign * (((mantissa << 1) + 33) << exponent) - 33;
+    return sample;
+  }
+
   // Start the RTP server and begin recording audio to a WAV file
   start() {
     this.fileStream = fs.createWriteStream(this.outFile); // Create a write stream for the output WAV file
