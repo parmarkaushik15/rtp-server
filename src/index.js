@@ -25,6 +25,10 @@ const ARI_USERNAME = process.env.ARI_USERNAME || 'asterisk';
 const ARI_PASSWORD = process.env.ARI_PASSWORD || 'asterisk123';
 const RTP_PORT = parseInt(process.env.RTP_PORT || '20000');
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(__dirname, '..', 'recordings');
+// Codec configuration - must match the codec used by the SIP endpoints
+// Options: 'ulaw' (PCMU, G.711 μ-law) or 'alaw' (PCMA, G.711 A-law)
+// Since external media doesn't negotiate via SDP, this must match exactly
+const EXTERNAL_MEDIA_CODEC = process.env.EXTERNAL_MEDIA_CODEC || 'alaw';
 
 // Determine RTP server address - use IP address that Asterisk can reach
 // If running locally, use the Asterisk server's IP or localhost
@@ -352,13 +356,49 @@ rtpServer.on('message', (msg, rinfo) => {
         } else if (payloadType === 8 || session.codec === 'PCMA') {
           // PCMA (G.711 A-law)
           if (payload.length > 0) {
+            // Check for silence packets (0xD5 in A-law is silence, similar to 0x7F in μ-law)
+            let silenceCount = 0;
+            for (let i = 0; i < payload.length; i++) {
+              if (payload[i] === 0xD5) silenceCount++;  // A-law silence value
+            }
+            
             const pcmData = convertPCMAtoPCM(payload);
             if (pcmData && pcmData.length > 0) {
+              // Check if PCM data contains actual audio (not all zeros or silence)
+              let maxSample = 0;
+              let minSample = 0;
+              let nonZeroSamples = 0;
+              for (let i = 0; i < pcmData.length; i += 2) {
+                const sample = pcmData.readInt16LE(i);
+                if (sample !== 0) nonZeroSamples++;
+                maxSample = Math.max(maxSample, Math.abs(sample));
+                minSample = Math.min(minSample, Math.abs(sample));
+              }
+              
+              // Log audio level diagnostics for first few packets
+              if (session.packetCount === 0) {
+                console.log(`[7001/7002] Audio level check (A-law) - Max: ${maxSample}, Min: ${minSample}, Non-zero samples: ${nonZeroSamples}/${pcmData.length/2}`);
+                console.log(`[7001/7002] Silence check (A-law) - silence bytes (0xD5): ${silenceCount}/${payload.length}`);
+                if (silenceCount === payload.length) {
+                  console.warn(`[7001/7002] ⚠ WARNING: All payload bytes are silence (0xD5). No audio data in packet.`);
+                }
+                if (maxSample < 100) {
+                  console.warn(`[7001/7002] ⚠ WARNING: Very low audio levels detected (max=${maxSample}). Audio may be silent or very quiet.`);
+                }
+                // Show first few PCM samples for debugging
+                const sampleCount = Math.min(5, pcmData.length / 2);
+                const samples = [];
+                for (let i = 0; i < sampleCount * 2; i += 2) {
+                  samples.push(pcmData.readInt16LE(i));
+                }
+                console.log(`[7001/7002] First ${sampleCount} PCM samples (A-law):`, samples);
+              }
+              
               try {
                 session.writeStream.write(pcmData);
                 session.packetCount = (session.packetCount || 0) + 1;
                 if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}`);
+                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}, Max level=${maxSample}`);
                 }
               } catch (writeErr) {
                 console.error(`[7001/7002] Error writing to WAV stream:`, writeErr.message || writeErr);
@@ -806,11 +846,13 @@ async function connectARI() {
         const { writeStream, fileStream } = createWAVWriter(wavPath, 8000, 1, 16);
         
         // Store session (no bridgeId yet - will be set when Dial() creates bridge)
+        // Map codec format to internal codec name
+        const sessionCodec = EXTERNAL_MEDIA_CODEC === 'alaw' ? 'PCMA' : 'PCMU';
         activeSessions.set(sessionId, {
           channelId: channel.id,
           rtpAddress: rtpAddress,
           rtpPort: rtpPort,
-          codec: 'PCMU',
+          codec: sessionCodec,  // PCMA for alaw, PCMU for ulaw
           writeStream: writeStream,
           fileStream: fileStream,
           wavPath: wavPath,
@@ -827,16 +869,19 @@ async function connectARI() {
         
         // Create external media channel (matching reference implementation)
         // NOTE: We DON'T add it to a bridge yet - we'll add it to Dial()'s bridge when it's created
+        // CRITICAL: Codec must match the codec used by the SIP endpoints
+        // Since external media doesn't negotiate via SDP, format must match exactly
         try {
           const extParams = {
             app: 'rtp-recorder',
             external_host: `${rtpAddress}:${rtpPort}`,
-            format: 'ulaw',
+            format: EXTERNAL_MEDIA_CODEC,  // Use configured codec (alaw or ulaw)
             transport: 'udp',
             encapsulation: 'rtp',
             connection_type: 'client',
             direction: 'both'
           };
+          console.log(`[7001/7002] Creating external media channel with codec: ${EXTERNAL_MEDIA_CODEC}`);
           const extChannel = await ariClient.channels.externalMedia(extParams);
           // Store mapping but WITHOUT bridgeId - will be set when Dial() creates bridge
           extMap.set(extChannel.id, { bridgeId: null, sessionId: sessionId });
