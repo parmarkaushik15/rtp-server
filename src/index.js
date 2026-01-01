@@ -1,3 +1,10 @@
+// Load environment variables from .env file if it exists
+try {
+  require('dotenv').config();
+} catch (e) {
+  // dotenv not installed or .env file doesn't exist - use process.env directly
+}
+
 const express = require('express');
 const ari = require('ari-client');
 const dgram = require('dgram');
