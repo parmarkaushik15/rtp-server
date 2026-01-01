@@ -110,13 +110,21 @@ rtpServer.on('message', (msg, rinfo) => {
   // Parse RTP header
   const version = (msg[0] >> 6) & 0x3;
   const padding = (msg[0] >> 5) & 0x1;
-  const extension = (msg[0] >> 4) & 0x1;
+  const hasExtension = (msg[0] >> 4) & 0x1;  // RTP extension header flag
   const csrcCount = msg[0] & 0xf;
   const marker = (msg[1] >> 7) & 0x1;
   const payloadType = msg[1] & 0x7f;
   const sequenceNumber = (msg[2] << 8) | msg[3];
   const timestamp = (msg[4] << 24) | (msg[5] << 16) | (msg[6] << 8) | msg[7];
   const ssrc = (msg[8] << 24) | (msg[9] << 16) | (msg[10] << 8) | msg[11];
+  
+  // Calculate payload offset: 12 bytes base header + CSRC (4 bytes each) + extension header (if present)
+  let payloadOffset = 12 + (csrcCount * 4);
+  if (hasExtension && msg.length > payloadOffset) {
+    // Extension header: 2 bytes (length field) + length * 4 bytes
+    const extLength = ((msg[payloadOffset] << 8) | msg[payloadOffset + 1]) * 4;
+    payloadOffset += 2 + extLength;  // 2 bytes for length field + extension data
+  }
   
   // Only log packet details if we have active (non-closing) 7001/7002 sessions
   if (hasTargetSessions) {
@@ -237,33 +245,74 @@ rtpServer.on('message', (msg, rinfo) => {
     }
     
     if (session && session.writeStream) {
-      // Extract payload (skip 12 byte header + CSRC if present)
-      const payloadOffset = 12 + (csrcCount * 4);
+      // Payload offset already calculated above (includes extension header if present)
       if (msg.length > payloadOffset) {
         const payload = msg.slice(payloadOffset);
         
+        // Debug: Log first packet details to verify payload extraction
+        if (session.packetCount === 0) {
+          console.log(`[7001/7002] First packet for session ${sessionId.substring(0, 8)}...: payload size=${payload.length}, total packet=${msg.length}, payloadOffset=${payloadOffset}, PT=${payloadType}`);
+          if (payload.length > 0) {
+            console.log(`[7001/7002] First payload bytes (hex): ${payload.slice(0, Math.min(20, payload.length)).toString('hex')}`);
+          }
+        }
+        
         // Convert PCMU (G.711 μ-law) to PCM
         if (payloadType === 0 || session.codec === 'PCMU') {
-          const pcmData = convertPCMUtoPCM(payload);
-          if (pcmData) {
-            session.writeStream.write(pcmData);
-            session.packetCount = (session.packetCount || 0) + 1;
-            if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-              console.log(`[7001/7002] Session ${sessionId} (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}`);
+          if (payload.length > 0) {
+            const pcmData = convertPCMUtoPCM(payload);
+            if (pcmData && pcmData.length > 0) {
+              try {
+                session.writeStream.write(pcmData);
+                session.packetCount = (session.packetCount || 0) + 1;
+                if (session.packetCount === 1 || session.packetCount % 100 === 0) {
+                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}`);
+                }
+              } catch (writeErr) {
+                console.error(`[7001/7002] Error writing to WAV stream:`, writeErr.message || writeErr);
+              }
+            } else {
+              if (session.packetCount === 0) {
+                console.warn(`[7001/7002] Warning: PCM conversion returned empty buffer for first packet`);
+              }
+            }
+          } else {
+            if (session.packetCount === 0) {
+              console.warn(`[7001/7002] Warning: Empty payload in first packet`);
             }
           }
         } else if (payloadType === 8 || session.codec === 'PCMA') {
           // PCMA (G.711 A-law)
-          const pcmData = convertPCMAtoPCM(payload);
-          if (pcmData) {
-            session.writeStream.write(pcmData);
-            session.packetCount = (session.packetCount || 0) + 1;
-            if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-              console.log(`[7001/7002] Session ${sessionId} (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}`);
+          if (payload.length > 0) {
+            const pcmData = convertPCMAtoPCM(payload);
+            if (pcmData && pcmData.length > 0) {
+              try {
+                session.writeStream.write(pcmData);
+                session.packetCount = (session.packetCount || 0) + 1;
+                if (session.packetCount === 1 || session.packetCount % 100 === 0) {
+                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}`);
+                }
+              } catch (writeErr) {
+                console.error(`[7001/7002] Error writing to WAV stream:`, writeErr.message || writeErr);
+              }
+            } else {
+              if (session.packetCount === 0) {
+                console.warn(`[7001/7002] Warning: PCM conversion returned empty buffer for first packet`);
+              }
+            }
+          } else {
+            if (session.packetCount === 0) {
+              console.warn(`[7001/7002] Warning: Empty payload in first packet`);
             }
           }
         } else {
-          console.log(`[7001/7002] Session ${sessionId}: Unsupported payload type ${payloadType}`);
+          if (session.packetCount === 0) {
+            console.log(`[7001/7002] Session ${sessionId}: Unsupported payload type ${payloadType} (expected 0 for PCMU or 8 for PCMA)`);
+          }
+        }
+      } else {
+        if (session.packetCount === 0) {
+          console.warn(`[7001/7002] Warning: Packet too short (${msg.length} bytes, need > ${payloadOffset})`);
         }
       }
     } else {
@@ -348,25 +397,26 @@ rtpServer.bind(RTP_PORT, '0.0.0.0', () => {
   console.log(`  You should see [UDP] Packet logs if connectivity is OK\n`);
 });
 
-// G.711 μ-law to PCM conversion table
-const mulawTable = new Int16Array(256);
-for (let i = 0; i < 256; i++) {
-  let sign = (i & 0x80) ? -1 : 1;
-  let exponent = (i & 0x70) >> 4;
-  let mantissa = i & 0x0f;
-  let sample = mantissa << (exponent + 3);
-  if (exponent !== 0) sample += (0x84 << exponent);
-  mulawTable[i] = sign * sample;
+// Convert a single μ-law sample to linear PCM (16-bit) - matching reference implementation
+function muLawToLinear(mu) {
+  mu = ~mu & 0xFF;                           // Bitwise NOT and mask to get 8-bit μ-law value
+  const sign = (mu & 0x80) ? -1 : 1;      // Extract sign bit (0x80): -1 for negative, 1 for positive
+  const exponent = (mu >> 4) & 0x07;      // Extract 3-bit exponent (bits 4-6)
+  const mantissa = mu & 0x0F;             // Extract 4-bit mantissa (bits 0-3)
+  const sample = sign * (((mantissa << 1) + 33) << exponent) - 33; // Convert to linear PCM using μ-law formula
+  return sample;                           // Return the 16-bit PCM sample
 }
 
-// Convert PCMU (μ-law) to PCM
+// Convert PCMU (μ-law) to PCM - matching reference implementation
 function convertPCMUtoPCM(pcmuData) {
-  const pcmData = Buffer.alloc(pcmuData.length * 2);
-  for (let i = 0; i < pcmuData.length; i++) {
-    const pcmValue = mulawTable[pcmuData[i]];
-    pcmData.writeInt16LE(pcmValue, i * 2);
+  const numSamples = pcmuData.length;      // Number of μ-law samples in the buffer
+  const pcmData = Buffer.alloc(numSamples * 2); // Allocate buffer for PCM (2 bytes per sample)
+  for (let i = 0; i < numSamples; i++) {   // Loop through each μ-law sample
+    const mu = pcmuData[i];                // Get the current μ-law sample
+    const linear = muLawToLinear(mu);       // Convert it to linear PCM
+    pcmData.writeInt16LE(linear, i * 2);   // Write PCM sample as 16-bit little-endian
   }
-  return pcmData;
+  return pcmData;                          // Return the PCM buffer
 }
 
 // G.711 A-law to PCM conversion table
