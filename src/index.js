@@ -64,6 +64,9 @@ try {
 // Store active RTP sessions
 const activeSessions = new Map();
 
+// Global persistent recording bridge (created at startup, reused for all calls)
+let persistentRecordingBridge = null;
+
 // RTP Server - listens for RTP packets
 const rtpServer = dgram.createSocket('udp4');
 
@@ -73,25 +76,32 @@ let totalUdpPackets = 0;
 rtpServer.on('message', (msg, rinfo) => {
   totalUdpPackets++;
   
-  // Log ALL UDP packets for first 20 packets to debug
-  if (totalUdpPackets <= 20) {
-    console.log(`\n[UDP] Packet #${totalUdpPackets}: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
-    if (msg.length >= 12) {
-      const firstByte = msg[0];
-      const version = (firstByte >> 6) & 0x3;
-      const payloadType = msg[1] & 0x7f;
-      console.log(`[UDP] Looks like RTP: version=${version}, PT=${payloadType}, hex=${msg.slice(0, 12).toString('hex')}`);
-    } else {
-      console.log(`[UDP] Too short for RTP, hex=${msg.toString('hex')}`);
+  // Check if we have any active 7001/7002 sessions before logging
+  const hasTargetSessions = Array.from(activeSessions.values()).some(s => s.extension === '7001' || s.extension === '7002');
+  
+  // Only log UDP packet details if we have 7001/7002 sessions active
+  if (hasTargetSessions) {
+    // Log ALL UDP packets for first 20 packets to debug
+    if (totalUdpPackets <= 20) {
+      console.log(`\n[7001/7002] [UDP] Packet #${totalUdpPackets}: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
+      if (msg.length >= 12) {
+        const firstByte = msg[0];
+        const version = (firstByte >> 6) & 0x3;
+        const payloadType = msg[1] & 0x7f;
+        console.log(`[7001/7002] [UDP] Looks like RTP: version=${version}, PT=${payloadType}, hex=${msg.slice(0, 12).toString('hex')}`);
+      } else {
+        console.log(`[7001/7002] [UDP] Too short for RTP, hex=${msg.toString('hex')}`);
+      }
+    } else if (totalUdpPackets % 100 === 0) {
+      const targetSessionCount = Array.from(activeSessions.values()).filter(s => s.extension === '7001' || s.extension === '7002').length;
+      console.log(`[7001/7002] [UDP] Total UDP packets received: ${totalUdpPackets} (${targetSessionCount} active 7001/7002 sessions)`);
     }
-  } else if (totalUdpPackets % 100 === 0) {
-    console.log(`[UDP] Total UDP packets received: ${totalUdpPackets}`);
   }
   
   // RTP packet structure: 12 bytes header + payload
   if (msg.length < 12) {
-    if (totalUdpPackets <= 20) {
-      console.log(`[UDP] Packet too short for RTP: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
+    if (hasTargetSessions && totalUdpPackets <= 20) {
+      console.log(`[7001/7002] [UDP] Packet too short for RTP: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
     }
     return;
   }
@@ -107,60 +117,90 @@ rtpServer.on('message', (msg, rinfo) => {
   const timestamp = (msg[4] << 24) | (msg[5] << 16) | (msg[6] << 8) | msg[7];
   const ssrc = (msg[8] << 24) | (msg[9] << 16) | (msg[10] << 8) | msg[11];
   
-  // Always log first few packets to debug
-  const isFirstPacket = !global.rtpPacketCount;
-  global.rtpPacketCount = (global.rtpPacketCount || 0) + 1;
-  if (isFirstPacket || global.rtpPacketCount <= 10) {
-    console.log(`[RTP] Packet #${global.rtpPacketCount}: SSRC=${ssrc}, PT=${payloadType}, Seq=${sequenceNumber}, From=${rinfo.address}:${rinfo.port}, Size=${msg.length}, ActiveSessions=${activeSessions.size}`);
+  // Only log packet details if we have 7001/7002 sessions active
+  if (hasTargetSessions) {
+    // Always log first few packets to debug
+    const isFirstPacket = !global.rtpPacketCount;
+    global.rtpPacketCount = (global.rtpPacketCount || 0) + 1;
+    if (isFirstPacket || global.rtpPacketCount <= 10) {
+      console.log(`[7001/7002] [RTP] Packet #${global.rtpPacketCount}: SSRC=${ssrc}, PT=${payloadType}, Seq=${sequenceNumber}, From=${rinfo.address}:${rinfo.port}, Size=${msg.length}, ActiveSessions=${activeSessions.size}`);
+    }
+    
+    // Log every 100th packet to show we're receiving data
+    if (global.rtpPacketCount % 100 === 0) {
+      const targetSessionCount = Array.from(activeSessions.values()).filter(s => s.extension === '7001' || s.extension === '7002').length;
+      console.log(`[7001/7002] [RTP] Received ${global.rtpPacketCount} total packets (${targetSessionCount} active 7001/7002 sessions)`);
+    }
+  } else {
+    // Still count packets but don't log if no 7001/7002 sessions
+    global.rtpPacketCount = (global.rtpPacketCount || 0) + 1;
   }
   
-  // Log every 100th packet to show we're receiving data
-  if (global.rtpPacketCount % 100 === 0) {
-    console.log(`[RTP] Received ${global.rtpPacketCount} total packets`);
-  }
-  
-  // Find session by SSRC or address
+  // Find session by SSRC first
   let sessionId = findSessionBySSRC(ssrc);
+  
+  // If not found by SSRC, try matching by address/port
   if (!sessionId) {
     sessionId = findSessionByAddress(rinfo.address, rinfo.port);
   }
   
-  // If still not found, try matching by port only (for external media)
-  // External media sends RTP to our server on RTP_PORT
-  if (!sessionId) {
-    // Try to find any active session that matches the port
+  // If still not found, try matching ANY active session
+  // External media can send RTP from various ports, so be flexible
+  if (!sessionId && activeSessions.size > 0) {
     const sessions = Array.from(activeSessions.entries());
-    for (const [sid, sess] of sessions) {
-      // Match by port - external media sends to our RTP_PORT
-      if (rinfo.port === sess.rtpPort || rinfo.port === RTP_PORT) {
-        sessionId = sid;
-        const session = sess;
-        // Update session with SSRC if not set
-        if (!session.ssrc) {
-          session.ssrc = ssrc;
-          console.log(`✓ Matched RTP packet by port ${rinfo.port}, assigned SSRC ${ssrc} to session ${sessionId}`);
-        } else if (session.ssrc === ssrc) {
-          // SSRC matches, use this session
+    
+    // If only one session, use it (most common case)
+    if (sessions.length === 1) {
+      sessionId = sessions[0][0];
+      const session = sessions[0][1];
+      if (!session.ssrc) {
+        session.ssrc = ssrc;
+        console.log(`✓✓✓ Matched RTP packet to only active session ${sessionId}, assigned SSRC ${ssrc} (From=${rinfo.address}:${rinfo.port})`);
+      } else if (session.ssrc === ssrc) {
+        // SSRC already matches
+        console.log(`✓ Matched RTP packet by SSRC ${ssrc} to session ${sessionId}`);
+      } else {
+        // Different SSRC but only one session - still use it (might be multiple streams)
+        console.log(`⚠ Using session ${sessionId} with different SSRC (session has ${session.ssrc}, packet has ${ssrc})`);
+      }
+    } else {
+      // Multiple sessions - try to match by port or use first session without SSRC
+      for (const [sid, sess] of sessions) {
+        // Match by port if it matches our RTP_PORT or session's expected port
+        if (rinfo.port === sess.rtpPort || rinfo.port === RTP_PORT || !sess.ssrc) {
           sessionId = sid;
+          const session = sess;
+          if (!session.ssrc) {
+            session.ssrc = ssrc;
+            console.log(`✓ Matched RTP packet to session ${sessionId} (no SSRC yet), assigned SSRC ${ssrc}`);
+          }
           break;
+        }
+      }
+      
+      // If still no match and we have sessions, use the first one without SSRC
+      if (!sessionId) {
+        for (const [sid, sess] of sessions) {
+          if (!sess.ssrc) {
+            sessionId = sid;
+            sess.ssrc = ssrc;
+            console.log(`✓✓✓ Using first session without SSRC ${sessionId}, assigned SSRC ${ssrc}`);
+            break;
+          }
         }
       }
     }
   }
   
-  // Last resort: if only one active session, use it
-  if (!sessionId && activeSessions.size === 1) {
-    const sessions = Array.from(activeSessions.entries());
-    sessionId = sessions[0][0];
-    const session = sessions[0][1];
-    if (!session.ssrc) {
-      session.ssrc = ssrc;
-      console.log(`✓ Using only active session, assigned SSRC ${ssrc} to session ${sessionId}`);
-    }
-  }
-  
   if (sessionId) {
     const session = activeSessions.get(sessionId);
+    
+    // FILTER: Only process packets for extensions 7001 and 7002
+    if (session && session.extension !== '7001' && session.extension !== '7002') {
+      // Skip packets from other extensions - don't log or process
+      return;
+    }
+    
     if (session && session.writeStream) {
       // Extract payload (skip 12 byte header + CSRC if present)
       const payloadOffset = 12 + (csrcCount * 4);
@@ -174,7 +214,7 @@ rtpServer.on('message', (msg, rinfo) => {
             session.writeStream.write(pcmData);
             session.packetCount = (session.packetCount || 0) + 1;
             if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-              console.log(`Session ${sessionId}: Received ${session.packetCount} packets, SSRC=${ssrc}`);
+              console.log(`[7001/7002] Session ${sessionId} (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}`);
             }
           }
         } else if (payloadType === 8 || session.codec === 'PCMA') {
@@ -184,26 +224,54 @@ rtpServer.on('message', (msg, rinfo) => {
             session.writeStream.write(pcmData);
             session.packetCount = (session.packetCount || 0) + 1;
             if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-              console.log(`Session ${sessionId}: Received ${session.packetCount} packets, SSRC=${ssrc}`);
+              console.log(`[7001/7002] Session ${sessionId} (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}`);
             }
           }
         } else {
-          console.log(`Session ${sessionId}: Unsupported payload type ${payloadType}`);
+          console.log(`[7001/7002] Session ${sessionId}: Unsupported payload type ${payloadType}`);
         }
       }
     } else {
       if (!sessionId) {
-        console.log(`No session found for SSRC=${ssrc}, From=${rinfo.address}:${rinfo.port}`);
+        // Only log if we have active 7001/7002 sessions
+        const hasTargetSessions = Array.from(activeSessions.values()).some(s => s.extension === '7001' || s.extension === '7002');
+        if (hasTargetSessions) {
+          console.log(`[7001/7002] No session found for SSRC=${ssrc}, From=${rinfo.address}:${rinfo.port}`);
+        }
       } else if (!session) {
-        console.log(`Session ${sessionId} not found in activeSessions`);
+        console.log(`[7001/7002] Session ${sessionId} not found in activeSessions`);
       } else if (!session.writeStream) {
-        console.log(`Session ${sessionId} has no writeStream`);
+        console.log(`[7001/7002] Session ${sessionId} has no writeStream`);
       }
     }
   } else {
-    // Log unmatched packets occasionally
-    if (Math.random() < 0.01) { // Log 1% of unmatched packets
-      console.log(`Unmatched RTP packet: SSRC=${ssrc}, PT=${payloadType}, From=${rinfo.address}:${rinfo.port}, Active sessions: ${activeSessions.size}`);
+    // Only log unmatched packets if we have active 7001/7002 sessions
+    const hasTargetSessions = Array.from(activeSessions.values()).some(s => s.extension === '7001' || s.extension === '7002');
+    
+    if (!hasTargetSessions) {
+      // No 7001/7002 sessions active - silently ignore all unmatched packets
+      return;
+    }
+    
+    // Log unmatched packets only if we have 7001/7002 sessions (might be for them)
+    if (activeSessions.size === 0) {
+      // Log first few unmatched packets when no sessions exist
+      if (global.unmatchedPacketCount === undefined) {
+        global.unmatchedPacketCount = 0;
+      }
+      global.unmatchedPacketCount++;
+      if (global.unmatchedPacketCount <= 10 || global.unmatchedPacketCount % 100 === 0) {
+        console.log(`[7001/7002] ⚠ Unmatched RTP packet: SSRC=${ssrc}, PT=${payloadType}, From=${rinfo.address}:${rinfo.port}, Active sessions: 0`);
+        console.log(`  → No active sessions! Packets arriving but no call in progress.`);
+      }
+    } else {
+      // Log occasionally when we have sessions but can't match
+      if (Math.random() < 0.01) {
+        const targetSessions = Array.from(activeSessions.entries()).filter(([_, s]) => s.extension === '7001' || s.extension === '7002');
+        console.log(`[7001/7002] ⚠ Unmatched RTP packet: SSRC=${ssrc}, PT=${payloadType}, From=${rinfo.address}:${rinfo.port}`);
+        console.log(`  → Active 7001/7002 sessions:`, targetSessions.map(([id, s]) => `${id} (${s.extension})`));
+        console.log(`  → Session SSRCs:`, targetSessions.map(([_, s]) => s.ssrc || 'none'));
+      }
     }
   }
 });
@@ -577,7 +645,6 @@ async function connectARI() {
     
     // Create PERSISTENT recording bridge at startup - reuse for all calls
     console.log('\n=== Creating Persistent Recording Bridge ===');
-    let persistentRecordingBridge;
     try {
       persistentRecordingBridge = await ariClient.bridges.create({
         type: 'mixing',
@@ -1087,20 +1154,15 @@ async function connectARI() {
     ariClient.on('StasisEnd', async (event, channel) => {
       console.log(`Channel ${channel.id} left Stasis application`);
       
-      // Cleanup recording session if channel was being recorded
+      // CRITICAL: Do NOT cleanup session here! Channels leave Stasis when continueInDialplan() is called,
+      // but RTP packets continue to arrive during the call. We'll cleanup only on actual channel hangup.
       const channelInfo = channelsToRecord.get(channel.id);
       if (channelInfo) {
-        await cleanupSession(channelInfo.sessionId);
-        channelsToRecord.delete(channel.id);
-      } else {
-        // Fallback: find session by channel ID
-        for (const [sessionId, session] of activeSessions.entries()) {
-          if (session.channelId === channel.id) {
-            await cleanupSession(sessionId);
-            break;
-          }
-        }
+        console.log(`  → Channel ${channel.id} left Stasis, but keeping session ${channelInfo.sessionId} alive for RTP recording`);
+        console.log(`  → Session will be cleaned up when channel hangs up (ChannelHangupRequest event)`);
       }
+      // Don't delete from channelsToRecord - we need it for hangup detection
+      // Sessions stay alive until ChannelHangupRequest fires
     });
     
     // Start Stasis application
