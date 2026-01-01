@@ -881,6 +881,25 @@ async function connectARI() {
         return;
       }
       
+      // Check if this is an outbound channel we originated (has 'dialed' in appArgs or in our tracking)
+      const channelInfo = channelsToRecord.get(channel.id);
+      if (channelInfo && channelInfo.isOutbound && channelInfo.bridgeId) {
+        console.log(`[7001/7002] Outbound channel ${channel.id} entered Stasis - adding to bridge ${channelInfo.bridgeId}`);
+        try {
+          const outboundBridge = await ariClient.bridges.get({ bridgeId: channelInfo.bridgeId });
+          await outboundBridge.addChannel({ channel: channel.id });
+          console.log(`[7001/7002] ✓✓✓ Added outbound channel ${channel.id} to bridge ${channelInfo.bridgeId} ✓✓✓`);
+          
+          // Verify bridge now has all channels
+          const verifyBridge = await ariClient.bridges.get({ bridgeId: channelInfo.bridgeId });
+          console.log(`[7001/7002] Bridge ${channelInfo.bridgeId} now has channels:`, verifyBridge.channels || []);
+          console.log(`[7001/7002] Expected: SIP channel + External media + Outbound channel`);
+          return; // Don't process as SIP channel
+        } catch (err) {
+          console.error(`[7001/7002] Error adding outbound channel to bridge:`, err.message || err);
+        }
+      }
+      
       console.log(`SIP channel started: ${channel.id}`);
       try {
         // Answer the channel first
@@ -970,8 +989,62 @@ async function connectARI() {
           });
           
           // External media channel will be added to bridge when it enters Stasis
-          // Continue in dialplan - Dial() will add the other party to our bridge
-          await channel.continueInDialplan();
+          // CRITICAL: Do NOT call continueInDialplan() - it causes the channel to leave Stasis
+          // and Dial() creates its own bridge, leaving our bridge with only external media
+          // Instead, we'll handle dialing via ARI to keep everything in our bridge
+          console.log(`[7001/7002] NOT calling continueInDialplan() - will handle dialing via ARI`);
+          console.log(`[7001/7002] Bridge ${bridge.id} ready with SIP channel ${channel.id}`);
+          console.log(`[7001/7002] Waiting for external media channel to be added...`);
+          
+          // Handle dialing via ARI instead of dialplan
+          // The dialplan expects us to dial, so we'll do it via ARI
+          try {
+            // Get the extension to dial from the channel's dialplan context
+            const dialTarget = extension === '7001' ? 'SIP/7001' : 'SIP/7002';
+            console.log(`[7001/7002] Dialing ${dialTarget} via ARI and adding to bridge ${bridge.id}...`);
+            
+            // Create an outbound channel for the dial target
+            const outboundChannel = await ariClient.channels.originate({
+              endpoint: dialTarget,
+              app: 'rtp-recorder',
+              appArgs: 'dialed'
+            });
+            console.log(`[7001/7002] ✓ Created outbound channel ${outboundChannel.id} for ${dialTarget}`);
+            
+            // Store bridge reference for when outbound channel enters Stasis
+            // The outbound channel will trigger StasisStart event, and we'll add it to the bridge there
+            // Store mapping so StasisStart handler can find the bridge
+            channelsToRecord.set(outboundChannel.id, {
+              sessionId: sessionId,
+              externalMediaId: extChannel.id,
+              extension: extension,
+              bridgeId: bridge.id, // Store bridge ID for outbound channel
+              isOutbound: true
+            });
+            
+            // Also try to add it immediately if channel is already up
+            setTimeout(async () => {
+              try {
+                const ch = await ariClient.channels.get({ channelId: outboundChannel.id });
+                if (ch && (ch.state === 'Up' || ch.state === 'Ring')) {
+                  await bridge.addChannel({ channel: outboundChannel.id });
+                  console.log(`[7001/7002] ✓✓✓ Added outbound channel ${outboundChannel.id} to bridge ${bridge.id} ✓✓✓`);
+                  
+                  // Verify bridge now has all channels
+                  const verifyBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
+                  console.log(`[7001/7002] Bridge ${bridge.id} now has channels:`, verifyBridge.channels || []);
+                  console.log(`[7001/7002] Expected: SIP channel + External media + Outbound channel`);
+                }
+              } catch (err) {
+                console.log(`[7001/7002] Outbound channel not ready yet, will add when it enters Stasis`);
+              }
+            }, 2000);
+          } catch (dialError) {
+            console.error(`[7001/7002] Error dialing via ARI:`, dialError.message || dialError);
+            // Fallback: continue in dialplan if ARI dialing fails
+            console.log(`[7001/7002] Falling back to continueInDialplan()...`);
+            await channel.continueInDialplan();
+          }
           
           // Handle channel hangup - cleanup session when call ends
           channel.on('ChannelHangupRequest', async () => {
@@ -1131,15 +1204,38 @@ async function connectARI() {
               }
               
             } catch (addErr) {
-              console.error(`  ⚠ Error adding external media to Dial() bridge:`, addErr.message || addErr);
-              // Retry adding to bridge
-              setTimeout(async () => {
+              const errorMsg = addErr.message || JSON.stringify(addErr);
+              console.error(`  ⚠ ERROR adding external media to Dial() bridge:`, errorMsg);
+              
+              // Check if error is "Bridge not in Stasis"
+              if (errorMsg.includes('not in Stasis') || errorMsg.includes('Stasis')) {
+                console.error(`  ⚠ CRITICAL: Dial()'s bridge ${bridge.id} is NOT in Stasis application`);
+                console.error(`  ⚠ This means we CANNOT add channels to it via ARI`);
+                console.error(`  ⚠ SOLUTION: External media must be added BEFORE Dial() creates its bridge`);
+                console.error(`  ⚠ OR: We must NOT use Dial() and handle dialing entirely via ARI`);
+              }
+              
+              // Retry adding to bridge with more aggressive retries
+              let retryCount = 0;
+              const maxRetries = 5;
+              const retryInterval = setInterval(async () => {
+                retryCount++;
                 try {
                   const dialBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
                   await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
-                  console.log(`✓ Retry successful: Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id}`);
+                  console.log(`✓ Retry ${retryCount} successful: Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id}`);
+                  clearInterval(retryInterval);
+                  
+                  // Verify it was added
+                  const verifyBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
+                  console.log(`  → Bridge ${bridge.id} now has channels:`, verifyBridge.channels || []);
                 } catch (retryErr) {
-                  console.error(`  ⚠ Retry failed:`, retryErr.message || retryErr);
+                  if (retryCount >= maxRetries) {
+                    console.error(`  ⚠ Retry ${retryCount} failed (max retries reached):`, retryErr.message || retryErr);
+                    clearInterval(retryInterval);
+                  } else {
+                    console.log(`  → Retry ${retryCount}/${maxRetries} failed, will retry...`);
+                  }
                 }
               }, 1000);
             }
@@ -1157,43 +1253,75 @@ async function connectARI() {
         const session = activeSessions.get(channelInfo.sessionId);
         if (!session || session.closing) continue;
         
-        // If bridgeId is not set yet, try to find Dial()'s bridge
-        if (!session.bridgeId) {
-          try {
-            // Get all bridges and check which one contains our channel
-            const bridges = await ariClient.bridges.list();
-            for (const bridge of bridges) {
-              if (bridge.channels && bridge.channels.includes(channelId)) {
-                // Found Dial()'s bridge!
-                console.log(`[Periodic Check] Found Dial() bridge ${bridge.id} for channel ${channelId}`);
-                session.bridgeId = bridge.id;
-                
-                // Update extMap
-                const extMapping = extMap.get(channelInfo.externalMediaId);
-                if (extMapping) {
-                  extMapping.bridgeId = bridge.id;
-                }
-                
-                // Add external media to bridge
-                try {
-                  const dialBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
-                  const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
-                  if (!bridgeInfo.channels || !bridgeInfo.channels.includes(channelInfo.externalMediaId)) {
-                    await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
-                    console.log(`[Periodic Check] ✓ Added external media ${channelInfo.externalMediaId} to bridge ${bridge.id}`);
-                  }
-                } catch (err) {
-                  console.error(`[Periodic Check] Error adding external media:`, err.message || err);
-                }
+        try {
+          // Get all bridges to find Dial()'s bridge
+          const bridges = await ariClient.bridges.list();
+          
+          // Find Dial()'s bridge (the one with both SIP channels, not our stasis-bridge)
+          let dialBridge = null;
+          for (const bridge of bridges) {
+            if (bridge.channels && bridge.channels.length >= 2) {
+              // Check if this bridge contains our SIP channel
+              if (bridge.channels.includes(channelId)) {
+                // This is likely Dial()'s bridge (has 2+ channels including our SIP channel)
+                dialBridge = bridge;
+                console.log(`[Periodic Check] Found Dial() bridge ${bridge.id} with ${bridge.channels.length} channels:`, bridge.channels);
                 break;
               }
             }
-          } catch (err) {
-            // Ignore periodic check errors
+          }
+          
+          if (dialBridge) {
+            // Update session bridge ID
+            if (session.bridgeId !== dialBridge.id) {
+              console.log(`[Periodic Check] Updating session bridgeId from ${session.bridgeId} to ${dialBridge.id}`);
+              session.bridgeId = dialBridge.id;
+            }
+            
+            // Check if external media is in this bridge
+            const extMediaInBridge = dialBridge.channels && dialBridge.channels.includes(channelInfo.externalMediaId);
+            
+            if (!extMediaInBridge) {
+              console.log(`[Periodic Check] ⚠ CRITICAL: External media ${channelInfo.externalMediaId} NOT in Dial() bridge ${dialBridge.id}`);
+              console.log(`[Periodic Check] Bridge ${dialBridge.id} has channels:`, dialBridge.channels || []);
+              console.log(`[Periodic Check] Adding external media to bridge...`);
+              
+              try {
+                const bridgeObj = await ariClient.bridges.get({ bridgeId: dialBridge.id });
+                await bridgeObj.addChannel({ channel: channelInfo.externalMediaId });
+                console.log(`[Periodic Check] ✓✓✓✓✓ SUCCESS: Added external media ${channelInfo.externalMediaId} to Dial() bridge ${dialBridge.id} ✓✓✓✓✓`);
+                
+                // Verify it was added
+                const verifyBridge = await ariClient.bridges.get({ bridgeId: dialBridge.id });
+                console.log(`[Periodic Check] Bridge ${dialBridge.id} now has channels:`, verifyBridge.channels || []);
+                console.log(`[Periodic Check] Expected: Both SIP channels + External media = 3 channels`);
+              } catch (addErr) {
+                console.error(`[Periodic Check] Error adding external media to bridge:`, addErr.message || addErr);
+                if (addErr.message && addErr.message.includes('not in Stasis')) {
+                  console.error(`[Periodic Check] ⚠ Bridge ${dialBridge.id} is not in Stasis - this is Dial()'s bridge`);
+                  console.error(`[Periodic Check] ⚠ Cannot add channels to Dial()'s bridge via ARI - this is a limitation`);
+                }
+              }
+            } else {
+              // External media is already in the correct bridge
+              if (session.packetCount % 500 === 0) { // Log every 500 packets to avoid spam
+                console.log(`[Periodic Check] ✓ External media ${channelInfo.externalMediaId} is correctly in bridge ${dialBridge.id}`);
+              }
+            }
+          } else {
+            // Dial()'s bridge not found yet - might still be connecting
+            if (session.packetCount < 10) { // Only log for first few packets
+              console.log(`[Periodic Check] Dial()'s bridge not found yet for channel ${channelId} (call might still be connecting)`);
+            }
+          }
+        } catch (err) {
+          // Ignore periodic check errors, but log them occasionally
+          if (Math.random() < 0.1) { // Log 10% of errors to avoid spam
+            console.error(`[Periodic Check] Error:`, err.message || err);
           }
         }
       }
-    }, 2000); // Check every 2 seconds
+    }, 1000); // Check every 1 second (more aggressive)
     
     // Monitor ChannelDialState to detect when Dial() connects
     ariClient.on('ChannelDialState', async (event, channel) => {
