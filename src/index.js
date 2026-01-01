@@ -161,7 +161,6 @@ rtpServer.on('message', (msg, rinfo) => {
         console.log(`✓ Matched RTP packet by SSRC ${ssrc} to session ${sessionId}`);
       } else {
         // Different SSRC but only one session - still use it (might be multiple streams)
-        console.log(`⚠ Using session ${sessionId} with different SSRC (session has ${session.ssrc}, packet has ${ssrc})`);
       }
     } else {
       // Multiple sessions - try to match by port or use first session without SSRC
