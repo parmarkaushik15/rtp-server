@@ -675,6 +675,31 @@ async function connectARI() {
         
         console.log(`Created RTP session ${sessionId} for extension ${extension} on ${rtpAddress}:${rtpPort}`);
         
+        // CRITICAL: Create bridge FIRST, before creating external media channel
+        // This ensures we're ready when external media channel enters Stasis
+        console.log(`\n=== Creating Recording Bridge (BEFORE external media) ===`);
+        const recordingBridge = await ariClient.bridges.create({
+          type: 'mixing',
+          name: `recording-${sessionId}`
+        });
+        console.log(`✓ Created mixing bridge: ${recordingBridge.id}`);
+        
+        // Store bridge reference in session
+        const session = activeSessions.get(sessionId);
+        if (session) {
+          session.recordingBridgeId = recordingBridge.id;
+          session.bridgeId = recordingBridge.id;
+          console.log(`  Stored bridge ID ${recordingBridge.id} in session`);
+        }
+        
+        // Track external media channel BEFORE creating it (to handle race condition)
+        const externalMediaChannelId = `external-${sessionId}`;
+        externalMediaChannels.set(externalMediaChannelId, {
+          sessionId: sessionId,
+          recordingBridgeId: recordingBridge.id
+        });
+        console.log(`  Pre-tracked external media channel ${externalMediaChannelId} - ready for StasisStart`);
+        
         // Create external media channel using ARI for recording
         let externalMedia;
         try {
@@ -687,35 +712,13 @@ async function connectARI() {
             app: 'rtp-recorder',
             external_host: externalHost,
             format: 'ulaw', // PCMU
-            channelId: `external-${sessionId}`
+            channelId: externalMediaChannelId
           });
           
           console.log(`Created external media channel: ${externalMedia.id}`);
           
-          // CRITICAL: External media channel enters Stasis immediately
-          // We MUST track it and add it to a bridge when it enters Stasis
-          // Create a mixing bridge immediately
-          console.log(`\n=== Creating Recording Bridge (URGENT) ===`);
-          const recordingBridge = await ariClient.bridges.create({
-            type: 'mixing',
-            name: `recording-${sessionId}`
-          });
-          console.log(`✓ Created mixing bridge: ${recordingBridge.id}`);
-          
-          // Store bridge reference in session
-          const session = activeSessions.get(sessionId);
-          if (session) {
-            session.recordingBridgeId = recordingBridge.id;
-            session.bridgeId = recordingBridge.id;
-            console.log(`  Stored bridge ID ${recordingBridge.id} in session`);
-          }
-          
-          // Track external media channel so we can add it to bridge when it enters Stasis
-          externalMediaChannels.set(externalMedia.id, {
-            sessionId: sessionId,
-            recordingBridgeId: recordingBridge.id
-          });
-          console.log(`  Tracked external media channel ${externalMedia.id} - will add to bridge when it enters Stasis`);
+          // External media channel will enter Stasis immediately
+          // Our StasisStart handler will catch it and add it to bridge
           
           // Monitor bridge for destruction
           recordingBridge.on('BridgeDestroyed', async () => {
@@ -723,8 +726,19 @@ async function connectARI() {
             await cleanupSession(sessionId);
           });
           
-          // Note: External media channel will enter Stasis, and we'll handle it in StasisStart handler
-          // This ensures we add it to bridge BEFORE it leaves Stasis
+          // Try to add external media channel immediately (backup in case StasisStart handler misses it)
+          setTimeout(async () => {
+            try {
+              const bridgeInfo = await ariClient.bridges.get({ bridgeId: recordingBridge.id });
+              if (!bridgeInfo.channels || !bridgeInfo.channels.includes(externalMedia.id)) {
+                console.log(`  Attempting backup: add external media channel ${externalMedia.id} to bridge`);
+                await recordingBridge.addChannel({ channel: externalMedia.id });
+                console.log(`  ✓ Backup: Added external media channel to bridge`);
+              }
+            } catch (e) {
+              // Ignore - StasisStart handler should handle it
+            }
+          }, 150);
           
           // Get channel details to extract SSRC (for packet matching)
           try {
@@ -816,20 +830,20 @@ async function connectARI() {
         });
         
         // Get session again to verify bridge status
-        const session = activeSessions.get(sessionId);
+        const sessionForVerification = activeSessions.get(sessionId);
         
         console.log(`\n=== External Media Channel Created ===`);
         console.log(`External Media Channel ID: ${externalMedia.id}`);
         console.log(`RTP Target: ${rtpAddress}:${rtpPort}`);
         console.log(`Format: ulaw (PCMU)`);
-        console.log(`Recording Bridge ID: ${session?.recordingBridgeId || 'N/A'}`);
+        console.log(`Recording Bridge ID: ${sessionForVerification?.recordingBridgeId || 'N/A'}`);
         
         // Verify bridge status
-        if (session && session.recordingBridgeId) {
+        if (sessionForVerification && sessionForVerification.recordingBridgeId) {
           try {
-            const bridgeInfo = await ariClient.bridges.get({ bridgeId: session.recordingBridgeId });
+            const bridgeInfo = await ariClient.bridges.get({ bridgeId: sessionForVerification.recordingBridgeId });
             console.log(`\n=== Bridge Status Verification ===`);
-            console.log(`Bridge ${session.recordingBridgeId} channels:`, bridgeInfo.channels || []);
+            console.log(`Bridge ${sessionForVerification.recordingBridgeId} channels:`, bridgeInfo.channels || []);
             if (bridgeInfo.channels && bridgeInfo.channels.includes(externalMedia.id)) {
               console.log(`✓✓✓ CONFIRMED: External media channel IS in bridge ✓✓✓`);
               console.log(`✓✓✓ RTP packets should now flow to ${rtpAddress}:${rtpPort} ✓✓✓\n`);
