@@ -28,6 +28,7 @@ const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(__dirname, '..', 
 // Codec configuration - must match the codec used by the SIP endpoints
 // Options: 'ulaw' (PCMU, G.711 μ-law) or 'alaw' (PCMA, G.711 A-law)
 // Since external media doesn't negotiate via SDP, this must match exactly
+// IMPORTANT: This must match the 'allow=' codec in sip.conf
 const EXTERNAL_MEDIA_CODEC = process.env.EXTERNAL_MEDIA_CODEC || 'alaw';
 
 // Determine RTP server address - use IP address that Asterisk can reach
@@ -335,13 +336,27 @@ rtpServer.on('message', (msg, rinfo) => {
               }
               
               try {
-                session.writeStream.write(pcmData);
-                session.packetCount = (session.packetCount || 0) + 1;
-                if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}, Max level=${maxSample}`);
+                // Check if stream is writable before writing
+                if (session.writeStream && session.writeStream.writable && !session.writeStream.destroyed) {
+                  const written = session.writeStream.write(pcmData);
+                  if (!written) {
+                    // Buffer is full, wait for drain
+                    session.writeStream.once('drain', () => {
+                      console.log(`[7001/7002] WAV stream drained for session ${sessionId.substring(0, 8)}...`);
+                    });
+                  }
+                  session.packetCount = (session.packetCount || 0) + 1;
+                  if (session.packetCount === 1 || session.packetCount % 100 === 0) {
+                    console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}, Max level=${maxSample}`);
+                  }
+                } else {
+                  if (session.packetCount === 0) {
+                    console.error(`[7001/7002] ⚠ WARNING: WriteStream not writable for first packet! writable=${session.writeStream?.writable}, destroyed=${session.writeStream?.destroyed}`);
+                  }
                 }
               } catch (writeErr) {
                 console.error(`[7001/7002] Error writing to WAV stream:`, writeErr.message || writeErr);
+                console.error(`[7001/7002] WriteStream state: writable=${session.writeStream?.writable}, destroyed=${session.writeStream?.destroyed}, writableEnded=${session.writeStream?.writableEnded}`);
               }
             } else {
               if (session.packetCount === 0) {
@@ -395,13 +410,27 @@ rtpServer.on('message', (msg, rinfo) => {
               }
               
               try {
-                session.writeStream.write(pcmData);
-                session.packetCount = (session.packetCount || 0) + 1;
-                if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}, Max level=${maxSample}`);
+                // Check if stream is writable before writing
+                if (session.writeStream && session.writeStream.writable && !session.writeStream.destroyed) {
+                  const written = session.writeStream.write(pcmData);
+                  if (!written) {
+                    // Buffer is full, wait for drain
+                    session.writeStream.once('drain', () => {
+                      console.log(`[7001/7002] WAV stream drained for session ${sessionId.substring(0, 8)}...`);
+                    });
+                  }
+                  session.packetCount = (session.packetCount || 0) + 1;
+                  if (session.packetCount === 1 || session.packetCount % 100 === 0) {
+                    console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}, Max level=${maxSample}`);
+                  }
+                } else {
+                  if (session.packetCount === 0) {
+                    console.error(`[7001/7002] ⚠ WARNING: WriteStream not writable for first packet! writable=${session.writeStream?.writable}, destroyed=${session.writeStream?.destroyed}`);
+                  }
                 }
               } catch (writeErr) {
                 console.error(`[7001/7002] Error writing to WAV stream:`, writeErr.message || writeErr);
+                console.error(`[7001/7002] WriteStream state: writable=${session.writeStream?.writable}, destroyed=${session.writeStream?.destroyed}, writableEnded=${session.writeStream?.writableEnded}`);
               }
             } else {
               if (session.packetCount === 0) {
@@ -843,7 +872,22 @@ async function connectARI() {
         const rtpAddress = getRTPServerAddress();
         
         const wavPath = path.join(RECORDINGS_DIR, `${sessionId}.wav`);
+        console.log(`[7001/7002] Creating WAV file at: ${wavPath}`);
         const { writeStream, fileStream } = createWAVWriter(wavPath, 8000, 1, 16);
+        
+        // Add error handlers to WAV writer streams
+        writeStream.on('error', (err) => {
+          console.error(`[7001/7002] WAV writeStream error for session ${sessionId}:`, err.message || err);
+        });
+        fileStream.on('error', (err) => {
+          console.error(`[7001/7002] WAV fileStream error for session ${sessionId}:`, err.message || err);
+        });
+        fileStream.on('finish', () => {
+          console.log(`[7001/7002] WAV fileStream finished writing for session ${sessionId}`);
+        });
+        fileStream.on('close', () => {
+          console.log(`[7001/7002] WAV fileStream closed for session ${sessionId}`);
+        });
         
         // Store session (no bridgeId yet - will be set when Dial() creates bridge)
         // Map codec format to internal codec name
@@ -1420,7 +1464,17 @@ async function cleanupSession(sessionId) {
     });
     
     const duration = session.startTime ? ((new Date() - session.startTime) / 1000) : 0;
-    console.log(`Recording ${sessionId} completed. Duration: ${duration.toFixed(2)}s. Packets: ${session.packetCount || 0}. File: ${session.wavPath}`);
+    const fileSize = session.wavPath && fs.existsSync(session.wavPath) ? fs.statSync(session.wavPath).size : 0;
+    console.log(`Recording ${sessionId} completed. Duration: ${duration.toFixed(2)}s. Packets: ${session.packetCount || 0}. File: ${session.wavPath}, Size: ${fileSize} bytes`);
+    
+    // Warn if file is too small (likely no audio data)
+    if (fileSize > 0 && fileSize < 1000) {
+      console.warn(`[7001/7002] ⚠ WARNING: WAV file is very small (${fileSize} bytes). This suggests no audio data was recorded.`);
+    } else if (fileSize === 0) {
+      console.error(`[7001/7002] ⚠ ERROR: WAV file was not created or is empty!`);
+    } else {
+      console.log(`[7001/7002] ✓ WAV file created successfully: ${(fileSize / 1024).toFixed(2)} KB`);
+    }
     
     // Convert to MP3 if needed (for now, keep as WAV)
     if (session.wavPath && fs.existsSync(session.wavPath)) {
