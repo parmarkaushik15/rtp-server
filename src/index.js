@@ -255,23 +255,36 @@ rtpServer.on('message', (msg, rinfo) => {
     }
     
     if (session && session.writeStream) {
-      // Extract payload - matching reference implementation: simple slice from byte 12
-      // Reference: const muPayload = msg.slice(12);
-      // For compatibility, use calculated offset, but log if it differs from 12
-      if (msg.length > payloadOffset) {
-        const payload = msg.slice(payloadOffset);
+      // Extract payload - EXACTLY matching reference implementation
+      // Reference code line 114: const muPayload = msg.slice(12);
+      // Simple approach: just skip 12-byte RTP header (no CSRC/extension handling)
+      if (msg.length > 12) {
+        const payload = msg.slice(12);  // Simple slice like reference
         
         // Debug: Log first packet details to verify payload extraction
         if (session.packetCount === 0) {
-          console.log(`[7001/7002] First packet for session ${sessionId.substring(0, 8)}...: payload size=${payload.length}, total packet=${msg.length}, payloadOffset=${payloadOffset}, PT=${payloadType}, CSRC=${csrcCount}, Ext=${hasExtension}`);
+          console.log(`[7001/7002] First packet for session ${sessionId.substring(0, 8)}...: payload size=${payload.length}, total packet=${msg.length}, PT=${payloadType}, CSRC=${csrcCount}, Ext=${hasExtension}`);
           if (payload.length > 0) {
             console.log(`[7001/7002] First payload bytes (hex): ${payload.slice(0, Math.min(20, payload.length)).toString('hex')}`);
             // Also show first few μ-law values for debugging
             const muSamples = [];
-            for (let i = 0; i < Math.min(5, payload.length); i++) {
+            for (let i = 0; i < Math.min(10, payload.length); i++) {
               muSamples.push(`0x${payload[i].toString(16).padStart(2, '0')}`);
             }
             console.log(`[7001/7002] First μ-law samples: ${muSamples.join(', ')}`);
+            
+            // Check if all bytes are the same (might indicate an issue)
+            const firstByte = payload[0];
+            let allSame = true;
+            for (let i = 1; i < Math.min(20, payload.length); i++) {
+              if (payload[i] !== firstByte) {
+                allSame = false;
+                break;
+              }
+            }
+            if (allSame && payload.length > 10) {
+              console.warn(`[7001/7002] ⚠ WARNING: All payload bytes are the same (0x${firstByte.toString(16)}). This might indicate a problem.`);
+            }
           }
         }
         
@@ -451,7 +464,8 @@ rtpServer.bind(RTP_PORT, '0.0.0.0', () => {
   console.log(`  You should see [UDP] Packet logs if connectivity is OK\n`);
 });
 
-// Convert a single μ-law sample to linear PCM (16-bit) - matching reference implementation
+// Convert a single μ-law sample to linear PCM (16-bit) - EXACTLY matching reference implementation
+// Reference: rtpServer.js line 23-29
 function muLawToLinear(mu) {
   mu = ~mu & 0xFF;                           // Bitwise NOT and mask to get 8-bit μ-law value
   const sign = (mu & 0x80) ? -1 : 1;      // Extract sign bit (0x80): -1 for negative, 1 for positive
@@ -459,6 +473,20 @@ function muLawToLinear(mu) {
   const mantissa = mu & 0x0F;             // Extract 4-bit mantissa (bits 0-3)
   const sample = sign * (((mantissa << 1) + 33) << exponent) - 33; // Convert to linear PCM using μ-law formula
   return sample;                           // Return the 16-bit PCM sample
+}
+
+// Test conversion: 0x7F (silence) should convert to a small value near 0
+// 0xFF (max positive) should convert to a positive value
+// 0x00 (max negative) should convert to a negative value
+if (typeof global !== 'undefined' && !global.muLawTestDone) {
+  global.muLawTestDone = true;
+  const testSilence = muLawToLinear(0x7F);  // Silence
+  const testMaxPos = muLawToLinear(0xFF);   // Max positive
+  const testMaxNeg = muLawToLinear(0x00);   // Max negative
+  console.log(`[μ-law Test] Silence (0x7F) -> ${testSilence}, MaxPos (0xFF) -> ${testMaxPos}, MaxNeg (0x00) -> ${testMaxNeg}`);
+  if (Math.abs(testSilence) > 100) {
+    console.warn(`[μ-law Test] ⚠ WARNING: Silence conversion seems wrong (expected ~0, got ${testSilence})`);
+  }
 }
 
 // Convert PCMU (μ-law) to PCM - matching reference implementation
