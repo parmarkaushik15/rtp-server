@@ -107,7 +107,7 @@ rtpServer.on('message', (msg, rinfo) => {
     return;
   }
   
-  // Parse RTP header
+  // Parse RTP header - matching reference implementation (simple 12-byte header)
   const version = (msg[0] >> 6) & 0x3;
   const padding = (msg[0] >> 5) & 0x1;
   const hasExtension = (msg[0] >> 4) & 0x1;  // RTP extension header flag
@@ -118,9 +118,19 @@ rtpServer.on('message', (msg, rinfo) => {
   const timestamp = (msg[4] << 24) | (msg[5] << 16) | (msg[6] << 8) | msg[7];
   const ssrc = (msg[8] << 24) | (msg[9] << 16) | (msg[10] << 8) | msg[11];
   
-  // Calculate payload offset: 12 bytes base header + CSRC (4 bytes each) + extension header (if present)
-  let payloadOffset = 12 + (csrcCount * 4);
-  if (hasExtension && msg.length > payloadOffset) {
+  // Payload extraction - matching reference: simple slice from byte 12
+  // Reference code: const muPayload = msg.slice(12);
+  // For most RTP packets, payload starts at byte 12 (after 12-byte header)
+  // If CSRC or extension headers are present, we'll handle them below
+  let payloadOffset = 12;
+  
+  // Handle CSRC if present (4 bytes per CSRC)
+  if (csrcCount > 0) {
+    payloadOffset += csrcCount * 4;
+  }
+  
+  // Handle extension header if present (matching RTP spec)
+  if (hasExtension && msg.length > payloadOffset + 4) {
     // Extension header: 2 bytes (length field) + length * 4 bytes
     const extLength = ((msg[payloadOffset] << 8) | msg[payloadOffset + 1]) * 4;
     payloadOffset += 2 + extLength;  // 2 bytes for length field + extension data
@@ -245,28 +255,72 @@ rtpServer.on('message', (msg, rinfo) => {
     }
     
     if (session && session.writeStream) {
-      // Payload offset already calculated above (includes extension header if present)
+      // Extract payload - matching reference implementation: simple slice from byte 12
+      // Reference: const muPayload = msg.slice(12);
+      // For compatibility, use calculated offset, but log if it differs from 12
       if (msg.length > payloadOffset) {
         const payload = msg.slice(payloadOffset);
         
         // Debug: Log first packet details to verify payload extraction
         if (session.packetCount === 0) {
-          console.log(`[7001/7002] First packet for session ${sessionId.substring(0, 8)}...: payload size=${payload.length}, total packet=${msg.length}, payloadOffset=${payloadOffset}, PT=${payloadType}`);
+          console.log(`[7001/7002] First packet for session ${sessionId.substring(0, 8)}...: payload size=${payload.length}, total packet=${msg.length}, payloadOffset=${payloadOffset}, PT=${payloadType}, CSRC=${csrcCount}, Ext=${hasExtension}`);
           if (payload.length > 0) {
             console.log(`[7001/7002] First payload bytes (hex): ${payload.slice(0, Math.min(20, payload.length)).toString('hex')}`);
+            // Also show first few μ-law values for debugging
+            const muSamples = [];
+            for (let i = 0; i < Math.min(5, payload.length); i++) {
+              muSamples.push(`0x${payload[i].toString(16).padStart(2, '0')}`);
+            }
+            console.log(`[7001/7002] First μ-law samples: ${muSamples.join(', ')}`);
           }
         }
         
         // Convert PCMU (G.711 μ-law) to PCM
         if (payloadType === 0 || session.codec === 'PCMU') {
           if (payload.length > 0) {
+            // Check for silence packets (0x7F in μ-law is silence)
+            let silenceCount = 0;
+            for (let i = 0; i < payload.length; i++) {
+              if (payload[i] === 0x7F) silenceCount++;
+            }
+            
             const pcmData = convertPCMUtoPCM(payload);
             if (pcmData && pcmData.length > 0) {
+              // Check if PCM data contains actual audio (not all zeros or silence)
+              let maxSample = 0;
+              let minSample = 0;
+              let nonZeroSamples = 0;
+              for (let i = 0; i < pcmData.length; i += 2) {
+                const sample = pcmData.readInt16LE(i);
+                if (sample !== 0) nonZeroSamples++;
+                maxSample = Math.max(maxSample, Math.abs(sample));
+                minSample = Math.min(minSample, Math.abs(sample));
+              }
+              
+              // Log audio level diagnostics for first few packets
+              if (session.packetCount === 0) {
+                console.log(`[7001/7002] Audio level check - Max: ${maxSample}, Min: ${minSample}, Non-zero samples: ${nonZeroSamples}/${pcmData.length/2}`);
+                console.log(`[7001/7002] Silence check - μ-law silence bytes (0x7F): ${silenceCount}/${payload.length}`);
+                if (silenceCount === payload.length) {
+                  console.warn(`[7001/7002] ⚠ WARNING: All payload bytes are silence (0x7F). No audio data in packet.`);
+                }
+                if (maxSample < 100) {
+                  console.warn(`[7001/7002] ⚠ WARNING: Very low audio levels detected (max=${maxSample}). Audio may be silent or very quiet.`);
+                }
+                // Show first few PCM samples for debugging
+                const sampleCount = Math.min(5, pcmData.length / 2);
+                const samples = [];
+                for (let i = 0; i < sampleCount * 2; i += 2) {
+                  samples.push(pcmData.readInt16LE(i));
+                }
+                console.log(`[7001/7002] First ${sampleCount} PCM samples:`, samples);
+              }
+              
               try {
                 session.writeStream.write(pcmData);
                 session.packetCount = (session.packetCount || 0) + 1;
                 if (session.packetCount === 1 || session.packetCount % 100 === 0) {
-                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}`);
+                  console.log(`[7001/7002] Session ${sessionId.substring(0, 8)}... (ext: ${session.extension}): Received ${session.packetCount} packets, SSRC=${ssrc}, PCM size=${pcmData.length}, Max level=${maxSample}`);
                 }
               } catch (writeErr) {
                 console.error(`[7001/7002] Error writing to WAV stream:`, writeErr.message || writeErr);
