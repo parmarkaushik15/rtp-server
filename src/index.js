@@ -796,10 +796,10 @@ async function connectARI() {
       }
     });
     
-    // Monitor for bridges created by Dial() and move external media channel to Dial's bridge
-    // If we have a recording bridge, move channels to Dial's bridge for proper call flow
+    // Monitor for bridges created by Dial() and add external media channel to Dial's bridge
+    // This is CRITICAL: Dial() creates its own bridge, and external media must be in that bridge to receive RTP
     ariClient.on('BridgeCreated', async (event, bridge) => {
-      console.log(`\n=== Bridge Created Event ===`);
+      console.log(`\n=== Bridge Created Event (Dial() bridge) ===`);
       console.log(`Bridge ID: ${bridge.id}`);
       console.log(`Bridge Type: ${bridge.bridge_type || 'N/A'}`);
       console.log(`Bridge channels:`, bridge.channels || []);
@@ -809,7 +809,8 @@ async function connectARI() {
         for (const channelId of bridge.channels) {
           const channelInfo = channelsToRecord.get(channelId);
           if (channelInfo) {
-            console.log(`\n✓✓✓ Found channel ${channelId} in bridge ${bridge.id} ✓✓✓`);
+            console.log(`\n✓✓✓✓✓ CRITICAL: Found channel ${channelId} in Dial() bridge ${bridge.id} ✓✓✓✓✓`);
+            console.log(`  → This is Dial()'s bridge - adding external media channel ${channelInfo.externalMediaId} to it`);
             
             const session = activeSessions.get(channelInfo.sessionId);
             if (!session) {
@@ -817,8 +818,11 @@ async function connectARI() {
               continue;
             }
             
-            // This is Dial()'s bridge - add external media channel to it
-            console.log(`  → This is Dial()'s bridge - adding external media channel ${channelInfo.externalMediaId} to it`);
+            // Check if session is already closing (call ended)
+            if (session.closing) {
+              console.log(`  → Session is already closing, skipping bridge addition`);
+              continue;
+            }
             
             // Update session with Dial()'s bridge ID
             session.bridgeId = bridge.id;
@@ -837,13 +841,19 @@ async function connectARI() {
                 continue;
               }
               
-              await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
-              console.log(`✓✓✓✓✓ CRITICAL: Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id} ✓✓✓✓✓`);
-              console.log(`  → RTP packets should now flow to our RTP server!`);
-              
-              // Verify it was added
+              // Check if external media channel is already in this bridge
               const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
-              console.log(`  → Bridge ${bridge.id} now has channels:`, bridgeInfo.channels || []);
+              if (bridgeInfo.channels && bridgeInfo.channels.includes(channelInfo.externalMediaId)) {
+                console.log(`  ✓ External media channel ${channelInfo.externalMediaId} is already in bridge ${bridge.id}`);
+              } else {
+                await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
+                console.log(`✓✓✓✓✓✓✓ CRITICAL SUCCESS: Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id} ✓✓✓✓✓✓✓`);
+                console.log(`  → RTP packets should now flow to our RTP server!`);
+                
+                // Verify it was added
+                const verifyBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
+                console.log(`  → Bridge ${bridge.id} now has channels:`, verifyBridge.channels || []);
+              }
               
             } catch (addErr) {
               console.error(`  ⚠ Error adding external media to Dial() bridge:`, addErr.message || addErr);
@@ -864,6 +874,51 @@ async function connectARI() {
         }
       }
     });
+    
+    // Periodic check to ensure external media channels get added to Dial() bridges
+    // This handles cases where BridgeCreated event might be missed
+    setInterval(async () => {
+      for (const [channelId, channelInfo] of channelsToRecord.entries()) {
+        const session = activeSessions.get(channelInfo.sessionId);
+        if (!session || session.closing) continue;
+        
+        // If bridgeId is not set yet, try to find Dial()'s bridge
+        if (!session.bridgeId) {
+          try {
+            // Get all bridges and check which one contains our channel
+            const bridges = await ariClient.bridges.list();
+            for (const bridge of bridges) {
+              if (bridge.channels && bridge.channels.includes(channelId)) {
+                // Found Dial()'s bridge!
+                console.log(`[Periodic Check] Found Dial() bridge ${bridge.id} for channel ${channelId}`);
+                session.bridgeId = bridge.id;
+                
+                // Update extMap
+                const extMapping = extMap.get(channelInfo.externalMediaId);
+                if (extMapping) {
+                  extMapping.bridgeId = bridge.id;
+                }
+                
+                // Add external media to bridge
+                try {
+                  const dialBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
+                  const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
+                  if (!bridgeInfo.channels || !bridgeInfo.channels.includes(channelInfo.externalMediaId)) {
+                    await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
+                    console.log(`[Periodic Check] ✓ Added external media ${channelInfo.externalMediaId} to bridge ${bridge.id}`);
+                  }
+                } catch (err) {
+                  console.error(`[Periodic Check] Error adding external media:`, err.message || err);
+                }
+                break;
+              }
+            }
+          } catch (err) {
+            // Ignore periodic check errors
+          }
+        }
+      }
+    }, 2000); // Check every 2 seconds
     
     // Monitor ChannelDialState to detect when Dial() connects
     ariClient.on('ChannelDialState', async (event, channel) => {
@@ -959,93 +1014,40 @@ async function connectARI() {
         const mapping = extMap.get(channel.id);
         extMap.delete(channel.id);
         console.log(`ExternalMedia channel ${channel.id} removed from map`);
-        
-        // If this was the last external media channel for a bridge, check if we should destroy it
-        if (mapping && mapping.bridgeId) {
-          // Check if any other external media channels are still using this bridge
-          const bridgeStillInUse = Array.from(extMap.values()).some(m => m.bridgeId === mapping.bridgeId);
-          if (!bridgeStillInUse) {
-            // No more external media channels using this bridge
-            // Find the bridge in sipMap and destroy it if SIP channel is also gone
-            const sipEntry = Array.from(sipMap.entries()).find(([_, bridge]) => bridge.id === mapping.bridgeId);
-            if (sipEntry) {
-              const [sipChannelId, bridge] = sipEntry;
-              // Check if SIP channel still exists (it might have left Stasis earlier)
-              try {
-                const sipChannel = await ariClient.channels.get({ channelId: sipChannelId });
-                if (!sipChannel || sipChannel.state === 'Down') {
-                  // SIP channel is down, safe to destroy bridge
-                  try {
-                    await bridge.destroy();
-                    console.log(`Bridge ${bridge.id} destroyed (external media ended, SIP channel down)`);
-                    sipMap.delete(sipChannelId);
-                  } catch (e) {
-                    console.error(`Error destroying bridge ${bridge.id}: ${e}`);
-                  }
-                }
-              } catch (e) {
-                // SIP channel doesn't exist or already gone, safe to destroy bridge
-                try {
-                  await bridge.destroy();
-                  console.log(`Bridge ${bridge.id} destroyed (external media ended, SIP channel gone)`);
-                  sipMap.delete(sipChannelId);
-                } catch (destroyErr) {
-                  console.error(`Error destroying bridge ${bridge.id}: ${destroyErr}`);
-                }
-              }
-            }
-          }
-        }
+        return; // External media channel cleanup done
       } else {
-        // Handle SIP channel cleanup (matching reference implementation)
-        const bridge = sipMap.get(channel.id);
+        // Handle SIP channel leaving Stasis
+        // CRITICAL: When continueInDialplan() is called, SIP channel leaves Stasis IMMEDIATELY
+        // But the call is still active! Dial() hasn't even created its bridge yet.
+        // We should NOT cleanup session here - we'll cleanup when call actually ends (ChannelHangupRequest)
         const channelInfo = channelsToRecord.get(channel.id);
-        
         if (channelInfo) {
-          // Mark session as closing before cleanup
-          const session = activeSessions.get(channelInfo.sessionId);
-          if (session) {
-            session.closing = true; // Mark as closing to ignore late-arriving packets
-            console.log(`[7001/7002] Channel ${channel.id} ended - marking session ${channelInfo.sessionId} as closing`);
-          }
-          
-          // Cleanup session
-          await cleanupSession(channelInfo.sessionId);
-          channelsToRecord.delete(channel.id);
-          
-          // Check if external media channel is still active before destroying bridge
-          const extMediaId = channelInfo.externalMediaId;
-          if (extMediaId && extMap.has(extMediaId)) {
-            // External media channel is still active - don't destroy bridge yet
-            // It will be destroyed when external media channel ends
-            console.log(`[7001/7002] SIP channel ${channel.id} ended, but external media ${extMediaId} still active - keeping bridge ${bridge?.id} alive`);
-            sipMap.delete(channel.id); // Remove SIP channel from map but keep bridge
-          } else {
-            // External media channel is gone, safe to destroy bridge
-            if (bridge) {
-              try {
-                await bridge.destroy();
-                console.log(`Bridge ${bridge.id} destroyed (SIP channel ended, external media gone)`);
-              } catch (e) {
-                console.error(`Error destroying bridge ${bridge.id}: ${e}`);
-              }
-              sipMap.delete(channel.id);
-            }
-          }
+          console.log(`[7001/7002] SIP channel ${channel.id} left Stasis (continueInDialplan called), but call is still active`);
+          console.log(`  → Keeping session ${channelInfo.sessionId} alive - will cleanup when call actually ends`);
+          console.log(`  → Waiting for Dial() to create bridge and add external media channel to it...`);
+          // DON'T cleanup session here - wait for actual call end
+          // Remove from sipMap but keep session alive
+          sipMap.delete(channel.id);
         } else {
-          // No channel info, just clean up bridge
-          if (bridge) {
-            try {
-              await bridge.destroy();
-              console.log(`Bridge ${bridge.id} destroyed`);
-            } catch (e) {
-              console.error(`Error destroying bridge ${bridge.id}: ${e}`);
-            }
-            sipMap.delete(channel.id);
-          }
+          sipMap.delete(channel.id);
         }
       }
-      console.log(`Channel ended: ${channel.id}`);
+      console.log(`Channel left Stasis: ${channel.id} (call may still be active)`);
+    });
+    
+    // Monitor channel state changes to detect when call actually ends
+    ariClient.on('ChannelStateChange', async (event, channel) => {
+      const channelInfo = channelsToRecord.get(channel.id);
+      if (channelInfo && channel.state === 'Down') {
+        // Channel is actually down now - cleanup session
+        console.log(`[7001/7002] Channel ${channel.id} state changed to Down - cleaning up session ${channelInfo.sessionId}`);
+        const session = activeSessions.get(channelInfo.sessionId);
+        if (session) {
+          session.closing = true;
+        }
+        await cleanupSession(channelInfo.sessionId);
+        channelsToRecord.delete(channel.id);
+      }
     });
     
     // Start Stasis application
