@@ -575,6 +575,35 @@ async function connectARI() {
     // Track external media channels that need to be added to bridges
     const externalMediaChannels = new Map(); // channelId -> { sessionId, recordingBridgeId }
     
+    // Create PERSISTENT recording bridge at startup - reuse for all calls
+    console.log('\n=== Creating Persistent Recording Bridge ===');
+    let persistentRecordingBridge;
+    try {
+      persistentRecordingBridge = await ariClient.bridges.create({
+        type: 'mixing',
+        name: 'rtp-recording-bridge'
+      });
+      console.log(`✓✓✓ Created persistent recording bridge: ${persistentRecordingBridge.id} ✓✓✓`);
+      console.log(`  This bridge will be reused for all recordings\n`);
+      
+      // Monitor bridge for destruction (shouldn't happen, but handle it)
+      persistentRecordingBridge.on('BridgeDestroyed', async () => {
+        console.error(`❌ CRITICAL: Persistent recording bridge was destroyed! Attempting to recreate...`);
+        try {
+          persistentRecordingBridge = await ariClient.bridges.create({
+            type: 'mixing',
+            name: 'rtp-recording-bridge'
+          });
+          console.log(`✓ Recreated persistent recording bridge: ${persistentRecordingBridge.id}`);
+        } catch (recreateErr) {
+          console.error(`❌ Failed to recreate bridge:`, recreateErr.message || recreateErr);
+        }
+      });
+    } catch (bridgeErr) {
+      console.error(`❌ CRITICAL: Failed to create persistent recording bridge:`, bridgeErr.message || bridgeErr);
+      throw new Error(`Cannot proceed without persistent recording bridge: ${bridgeErr.message || bridgeErr}`);
+    }
+    
     // Set up Stasis application - just set up recording, then continue in dialplan
     ariClient.on('StasisStart', async (event, channel) => {
       console.log(`Channel ${channel.id} entered Stasis application`);
@@ -591,24 +620,21 @@ async function connectARI() {
         if (externalMediaInfo) {
           console.log(`Found session ${externalMediaInfo.sessionId} for external media channel`);
           
-          // Get the recording bridge
-          const session = activeSessions.get(externalMediaInfo.sessionId);
-          if (session && session.recordingBridgeId) {
+          // Use PERSISTENT recording bridge (created at startup)
+          if (persistentRecordingBridge) {
             try {
-              const recordingBridge = await ariClient.bridges.get({ bridgeId: session.recordingBridgeId });
-              
-              // Add external media channel to bridge IMMEDIATELY - this is CRITICAL!
-              await recordingBridge.addChannel({ channel: channel.id });
-              console.log(`✓✓✓✓✓ URGENT: Added external media channel ${channel.id} to bridge ${session.recordingBridgeId} ✓✓✓✓✓`);
+              // Add external media channel to PERSISTENT bridge IMMEDIATELY - this is CRITICAL!
+              await persistentRecordingBridge.addChannel({ channel: channel.id });
+              console.log(`✓✓✓✓✓ URGENT: Added external media channel ${channel.id} to PERSISTENT bridge ${persistentRecordingBridge.id} ✓✓✓✓✓`);
               
               // Verify it was added immediately
               setTimeout(async () => {
                 try {
-                  const bridgeInfo = await ariClient.bridges.get({ bridgeId: session.recordingBridgeId });
-                  console.log(`\n  === Bridge Verification ===`);
-                  console.log(`  Bridge ${session.recordingBridgeId} channels:`, bridgeInfo.channels || []);
+                  const bridgeInfo = await ariClient.bridges.get({ bridgeId: persistentRecordingBridge.id });
+                  console.log(`\n  === Persistent Bridge Verification ===`);
+                  console.log(`  Bridge ${persistentRecordingBridge.id} channels:`, bridgeInfo.channels || []);
                   if (bridgeInfo.channels && bridgeInfo.channels.includes(channel.id)) {
-                    console.log(`  ✓✓✓ CONFIRMED: External media IS in bridge - RTP should flow! ✓✓✓`);
+                    console.log(`  ✓✓✓ CONFIRMED: External media IS in persistent bridge - RTP should flow! ✓✓✓`);
                   } else {
                     console.warn(`  ⚠⚠⚠ WARNING: External media NOT in bridge channels! ⚠⚠⚠`);
                   }
@@ -618,19 +644,18 @@ async function connectARI() {
               }, 300);
               
             } catch (addErr) {
-              console.error(`❌ CRITICAL: Failed to add external media to bridge:`, addErr.message || addErr);
+              console.error(`❌ CRITICAL: Failed to add external media to persistent bridge:`, addErr.message || addErr);
               // Try retry
               await new Promise(resolve => setTimeout(resolve, 100));
               try {
-                const recordingBridge = await ariClient.bridges.get({ bridgeId: session.recordingBridgeId });
-                await recordingBridge.addChannel({ channel: channel.id });
-                console.log(`✓ Added external media channel on retry`);
+                await persistentRecordingBridge.addChannel({ channel: channel.id });
+                console.log(`✓ Added external media channel to persistent bridge on retry`);
               } catch (retryErr) {
                 console.error(`❌ FAILED even on retry:`, retryErr.message || retryErr);
               }
             }
           } else {
-            console.warn(`⚠ No recording bridge found for external media channel`);
+            console.error(`❌ CRITICAL: Persistent recording bridge not available!`);
           }
         } else {
           console.warn(`⚠ External media channel ${channel.id} not found in tracking map`);
@@ -675,28 +700,23 @@ async function connectARI() {
         
         console.log(`Created RTP session ${sessionId} for extension ${extension} on ${rtpAddress}:${rtpPort}`);
         
-        // CRITICAL: Create bridge FIRST, before creating external media channel
-        // This ensures we're ready when external media channel enters Stasis
-        console.log(`\n=== Creating Recording Bridge (BEFORE external media) ===`);
-        const recordingBridge = await ariClient.bridges.create({
-          type: 'mixing',
-          name: `recording-${sessionId}`
-        });
-        console.log(`✓ Created mixing bridge: ${recordingBridge.id}`);
+        // Use PERSISTENT recording bridge (created at startup) - no need to create per call
+        console.log(`\n=== Using Persistent Recording Bridge ===`);
+        console.log(`  Persistent bridge ID: ${persistentRecordingBridge.id}`);
         
         // Store bridge reference in session
         const session = activeSessions.get(sessionId);
         if (session) {
-          session.recordingBridgeId = recordingBridge.id;
-          session.bridgeId = recordingBridge.id;
-          console.log(`  Stored bridge ID ${recordingBridge.id} in session`);
+          session.recordingBridgeId = persistentRecordingBridge.id;
+          session.bridgeId = persistentRecordingBridge.id;
+          console.log(`  Stored persistent bridge ID ${persistentRecordingBridge.id} in session`);
         }
         
         // Track external media channel BEFORE creating it (to handle race condition)
         const externalMediaChannelId = `external-${sessionId}`;
         externalMediaChannels.set(externalMediaChannelId, {
           sessionId: sessionId,
-          recordingBridgeId: recordingBridge.id
+          recordingBridgeId: persistentRecordingBridge.id
         });
         console.log(`  Pre-tracked external media channel ${externalMediaChannelId} - ready for StasisStart`);
         
@@ -720,20 +740,17 @@ async function connectARI() {
           // External media channel will enter Stasis immediately
           // Our StasisStart handler will catch it and add it to bridge
           
-          // Monitor bridge for destruction
-          recordingBridge.on('BridgeDestroyed', async () => {
-            console.log(`Recording bridge ${recordingBridge.id} destroyed`);
-            await cleanupSession(sessionId);
-          });
+          // Note: We're using persistent bridge, so no need to monitor destruction per call
+          // The persistent bridge stays alive for all calls
           
           // Try to add external media channel immediately (backup in case StasisStart handler misses it)
           setTimeout(async () => {
             try {
-              const bridgeInfo = await ariClient.bridges.get({ bridgeId: recordingBridge.id });
+              const bridgeInfo = await ariClient.bridges.get({ bridgeId: persistentRecordingBridge.id });
               if (!bridgeInfo.channels || !bridgeInfo.channels.includes(externalMedia.id)) {
-                console.log(`  Attempting backup: add external media channel ${externalMedia.id} to bridge`);
-                await recordingBridge.addChannel({ channel: externalMedia.id });
-                console.log(`  ✓ Backup: Added external media channel to bridge`);
+                console.log(`  Attempting backup: add external media channel ${externalMedia.id} to persistent bridge`);
+                await persistentRecordingBridge.addChannel({ channel: externalMedia.id });
+                console.log(`  ✓ Backup: Added external media channel to persistent bridge`);
               }
             } catch (e) {
               // Ignore - StasisStart handler should handle it
@@ -759,13 +776,13 @@ async function connectARI() {
             console.log(`Note: Could not get channel details: ${detailsError.message || 'Unknown error'}`);
           }
           
-          // Add original channel to bridge so audio flows
+          // Add original channel to PERSISTENT bridge so audio flows
           try {
-            await recordingBridge.addChannel({ channel: channel.id });
-            console.log(`✓ Added original channel ${channel.id} to recording bridge`);
-            console.log(`✓ Bridge ${recordingBridge.id} now has both channels - RTP should flow!\n`);
+            await persistentRecordingBridge.addChannel({ channel: channel.id });
+            console.log(`✓ Added original channel ${channel.id} to PERSISTENT recording bridge`);
+            console.log(`✓ Persistent bridge ${persistentRecordingBridge.id} now has both channels - RTP should flow!\n`);
           } catch (addChannelErr) {
-            console.warn(`Could not add original channel to bridge:`, addChannelErr.message || addChannelErr);
+            console.warn(`Could not add original channel to persistent bridge:`, addChannelErr.message || addChannelErr);
             console.log(`  Will add to Dial() bridge when it's created\n`);
           }
         } catch (externalMediaError) {
@@ -860,7 +877,8 @@ async function connectARI() {
         }
         
         // Continue channel in dialplan - Dial() will create its bridge
-        // When Dial() creates bridge, we'll move channels to it (see BridgeCreated handler)
+        // When Dial() creates bridge, we'll add external media channel to it (see BridgeCreated handler)
+        // Note: We keep channels in persistent bridge, but also add external media to Dial() bridge for recording
         await channel.continueInDialplan();
         
         // Handle channel hangup
@@ -907,23 +925,15 @@ async function connectARI() {
             
             const session = activeSessions.get(channelInfo.sessionId);
             
-            // If we have a recording bridge and Dial() created a new bridge, move channels
+            // If Dial() created a new bridge, add external media channel to it
+            // Note: We're using PERSISTENT bridge, so we don't destroy it
+            // When we add external media to Dial() bridge, it will automatically be removed from persistent bridge
             if (session && session.recordingBridgeId && session.recordingBridgeId !== bridge.id) {
-              console.log(`  Moving channels from recording bridge ${session.recordingBridgeId} to Dial() bridge ${bridge.id}`);
+              console.log(`  Dial() created bridge ${bridge.id}, adding external media channel to it`);
+              console.log(`  (External media will be moved from persistent bridge ${session.recordingBridgeId} to Dial() bridge)`);
               
               try {
-                const recordingBridgeObj = ariClient.Bridge();
-                recordingBridgeObj.id = session.recordingBridgeId;
-                
-                // Move external media channel to Dial's bridge
-                try {
-                  await recordingBridgeObj.removeChannel({ channel: channelInfo.externalMediaId });
-                  console.log(`✓ Removed external media from recording bridge`);
-                } catch (removeErr) {
-                  console.warn(`Could not remove from recording bridge:`, removeErr.message || removeErr);
-                }
-                
-                // Add external media to Dial's bridge
+                // Add external media to Dial's bridge (will auto-remove from persistent bridge)
                 const dialBridgeObj = ariClient.Bridge();
                 dialBridgeObj.id = bridge.id;
                 await dialBridgeObj.addChannel({ channel: channelInfo.externalMediaId });
@@ -932,23 +942,21 @@ async function connectARI() {
                 // Update session
                 session.bridgeId = bridge.id;
                 
-                // Destroy recording bridge
-                try {
-                  await recordingBridgeObj.destroy();
-                  console.log(`✓ Destroyed recording bridge ${session.recordingBridgeId}`);
-                } catch (destroyErr) {
-                  console.warn(`Could not destroy recording bridge:`, destroyErr.message || destroyErr);
-                }
-                
                 // Verify
-                const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
-                console.log(`Bridge ${bridge.id} channels:`, bridgeInfo.channels || []);
-                if (bridgeInfo.channels && bridgeInfo.channels.includes(channelInfo.externalMediaId)) {
-                  console.log(`✓✓✓ CONFIRMED: External media IS in Dial() bridge - RTP should flow! ✓✓✓\n`);
-                }
+                setTimeout(async () => {
+                  try {
+                    const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
+                    console.log(`Bridge ${bridge.id} channels:`, bridgeInfo.channels || []);
+                    if (bridgeInfo.channels && bridgeInfo.channels.includes(channelInfo.externalMediaId)) {
+                      console.log(`✓✓✓ CONFIRMED: External media IS in Dial() bridge - RTP should flow! ✓✓✓\n`);
+                    }
+                  } catch (e) {
+                    console.warn(`Could not verify: ${e.message || e}`);
+                  }
+                }, 200);
                 
-              } catch (moveErr) {
-                console.error(`Error moving channels:`, moveErr.message || moveErr);
+              } catch (addErr) {
+                console.error(`Error adding external media to Dial() bridge:`, addErr.message || addErr);
                 // Fall through to try adding directly
               }
             } else {
@@ -1162,17 +1170,21 @@ async function cleanupSession(sessionId) {
   if (!session) return;
   
   try {
-    // Clean up bridge if it exists
-    if (session.bridgeId && ariClient) {
+    // Note: We're using PERSISTENT bridge, so we don't destroy it here
+    // The persistent bridge stays alive for all calls
+    // Only destroy if it's NOT the persistent bridge (shouldn't happen, but safety check)
+    if (session.bridgeId && ariClient && session.bridgeId !== persistentRecordingBridge?.id) {
       try {
         const bridge = ariClient.Bridge();
         bridge.id = session.bridgeId;
         await bridge.destroy();
-        console.log(`Destroyed bridge ${session.bridgeId}`);
+        console.log(`Destroyed non-persistent bridge ${session.bridgeId}`);
       } catch (err) {
         // Bridge might already be destroyed, ignore
         console.log(`Bridge ${session.bridgeId} cleanup: ${err.message || 'already destroyed'}`);
       }
+    } else if (session.bridgeId === persistentRecordingBridge?.id) {
+      console.log(`Skipping destruction of persistent bridge ${session.bridgeId} (stays alive for all calls)`);
     }
     
     // End write stream if it exists
