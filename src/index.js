@@ -577,12 +577,28 @@ async function connectARI() {
     // Helper function to add external media channel to bridge (with retry logic, matching reference)
     async function addExtToBridge(client, channel, bridgeId, retries = 5, delay = 500) {
       try {
+        // Check if bridge still exists before attempting
         const bridge = await ariClient.bridges.get({ bridgeId });
         if (!bridge) throw new Error('Bridge not found');
+        
+        // Check if mapping still exists (session might be closing)
+        const mapping = extMap.get(channel.id);
+        if (!mapping || mapping.bridgeId !== bridgeId) {
+          console.log(`  → Mapping changed or removed, stopping retry for channel ${channel.id}`);
+          return;
+        }
+        
         await bridge.addChannel({ channel: channel.id });
-        console.log(`✓ ExternalMedia channel ${channel.id} added to bridge ${bridgeId}`);
+        console.log(`✓✓✓ ExternalMedia channel ${channel.id} added to bridge ${bridgeId} ✓✓✓`);
       } catch (err) {
-        if (retries) {
+        if (retries > 0) {
+          // Check if mapping still exists before retrying
+          const mapping = extMap.get(channel.id);
+          if (!mapping || mapping.bridgeId !== bridgeId) {
+            console.log(`  → Mapping changed or removed during retry, stopping for channel ${channel.id}`);
+            return;
+          }
+          
           console.log(`Retrying to add externalMedia channel ${channel.id} to bridge ${bridgeId} (${retries} attempts remaining)`);
           await new Promise(r => setTimeout(r, delay));
           return addExtToBridge(client, channel, bridgeId, retries - 1, delay);
@@ -599,14 +615,21 @@ async function connectARI() {
       
       // Check if this is an external media channel (UnicastRTP) - matching reference pattern
       if (channel.name && channel.name.startsWith('UnicastRTP')) {
-        console.log(`ExternalMedia channel started: ${channel.id}`);
+        console.log(`\n=== External Media Channel Entered Stasis ===`);
+        console.log(`ExternalMedia channel ${channel.id} started`);
         let mapping = extMap.get(channel.id);
         if (!mapping) { 
+          console.log(`  → Mapping not found, waiting 500ms...`);
           await new Promise(r => setTimeout(r, 500)); 
           mapping = extMap.get(channel.id); 
         }
         if (mapping) {
+          console.log(`  → Found mapping for bridge ${mapping.bridgeId}, adding to bridge...`);
           await addExtToBridge(ariClient, channel, mapping.bridgeId);
+          console.log(`  ✓ ExternalMedia channel ${channel.id} successfully added to bridge ${mapping.bridgeId}`);
+        } else {
+          console.warn(`  ⚠ ExternalMedia channel ${channel.id} not found in tracking map`);
+          console.warn(`  Available tracked channels:`, Array.from(extMap.keys()));
         }
         return;
       }
@@ -621,7 +644,8 @@ async function connectARI() {
       console.log(`SIP channel started: ${channel.id}`);
       try {
         // Create bridge per call (matching reference implementation)
-        const bridge = await ariClient.bridges.create({ type: 'mixing' });
+        // Using 'mixing,proxy_media' like reference for better media handling
+        const bridge = await ariClient.bridges.create({ type: 'mixing,proxy_media' });
         await bridge.addChannel({ channel: channel.id });
         sipMap.set(channel.id, bridge);
         console.log(`Created bridge ${bridge.id} and added SIP channel ${channel.id}`);
@@ -905,31 +929,93 @@ async function connectARI() {
       
       // Handle external media channel cleanup (matching reference implementation)
       if (channel.name && channel.name.startsWith('UnicastRTP')) {
+        const mapping = extMap.get(channel.id);
         extMap.delete(channel.id);
         console.log(`ExternalMedia channel ${channel.id} removed from map`);
+        
+        // If this was the last external media channel for a bridge, check if we should destroy it
+        if (mapping && mapping.bridgeId) {
+          // Check if any other external media channels are still using this bridge
+          const bridgeStillInUse = Array.from(extMap.values()).some(m => m.bridgeId === mapping.bridgeId);
+          if (!bridgeStillInUse) {
+            // No more external media channels using this bridge
+            // Find the bridge in sipMap and destroy it if SIP channel is also gone
+            const sipEntry = Array.from(sipMap.entries()).find(([_, bridge]) => bridge.id === mapping.bridgeId);
+            if (sipEntry) {
+              const [sipChannelId, bridge] = sipEntry;
+              // Check if SIP channel still exists (it might have left Stasis earlier)
+              try {
+                const sipChannel = await ariClient.channels.get({ channelId: sipChannelId });
+                if (!sipChannel || sipChannel.state === 'Down') {
+                  // SIP channel is down, safe to destroy bridge
+                  try {
+                    await bridge.destroy();
+                    console.log(`Bridge ${bridge.id} destroyed (external media ended, SIP channel down)`);
+                    sipMap.delete(sipChannelId);
+                  } catch (e) {
+                    console.error(`Error destroying bridge ${bridge.id}: ${e}`);
+                  }
+                }
+              } catch (e) {
+                // SIP channel doesn't exist or already gone, safe to destroy bridge
+                try {
+                  await bridge.destroy();
+                  console.log(`Bridge ${bridge.id} destroyed (external media ended, SIP channel gone)`);
+                  sipMap.delete(sipChannelId);
+                } catch (destroyErr) {
+                  console.error(`Error destroying bridge ${bridge.id}: ${destroyErr}`);
+                }
+              }
+            }
+          }
+        }
       } else {
         // Handle SIP channel cleanup (matching reference implementation)
         const bridge = sipMap.get(channel.id);
-        if (bridge) {
-          try {
-            await bridge.destroy();
-            console.log(`Bridge ${bridge.id} destroyed`);
-          } catch (e) {
-            console.error(`Error destroying bridge ${bridge.id}: ${e}`);
-          }
-          sipMap.delete(channel.id);
-        }
-        
-        // Cleanup session when SIP channel ends (matching reference implementation)
         const channelInfo = channelsToRecord.get(channel.id);
+        
         if (channelInfo) {
+          // Mark session as closing before cleanup
           const session = activeSessions.get(channelInfo.sessionId);
           if (session) {
             session.closing = true; // Mark as closing to ignore late-arriving packets
             console.log(`[7001/7002] Channel ${channel.id} ended - marking session ${channelInfo.sessionId} as closing`);
           }
+          
+          // Cleanup session
           await cleanupSession(channelInfo.sessionId);
           channelsToRecord.delete(channel.id);
+          
+          // Check if external media channel is still active before destroying bridge
+          const extMediaId = channelInfo.externalMediaId;
+          if (extMediaId && extMap.has(extMediaId)) {
+            // External media channel is still active - don't destroy bridge yet
+            // It will be destroyed when external media channel ends
+            console.log(`[7001/7002] SIP channel ${channel.id} ended, but external media ${extMediaId} still active - keeping bridge ${bridge?.id} alive`);
+            sipMap.delete(channel.id); // Remove SIP channel from map but keep bridge
+          } else {
+            // External media channel is gone, safe to destroy bridge
+            if (bridge) {
+              try {
+                await bridge.destroy();
+                console.log(`Bridge ${bridge.id} destroyed (SIP channel ended, external media gone)`);
+              } catch (e) {
+                console.error(`Error destroying bridge ${bridge.id}: ${e}`);
+              }
+              sipMap.delete(channel.id);
+            }
+          }
+        } else {
+          // No channel info, just clean up bridge
+          if (bridge) {
+            try {
+              await bridge.destroy();
+              console.log(`Bridge ${bridge.id} destroyed`);
+            } catch (e) {
+              console.error(`Error destroying bridge ${bridge.id}: ${e}`);
+            }
+            sipMap.delete(channel.id);
+          }
         }
       }
       console.log(`Channel ended: ${channel.id}`);
