@@ -77,8 +77,8 @@ let totalUdpPackets = 0;
 rtpServer.on('message', (msg, rinfo) => {
   totalUdpPackets++;
   
-  // Check if we have any active 7001/7002 sessions before logging
-  const hasTargetSessions = Array.from(activeSessions.values()).some(s => s.extension === '7001' || s.extension === '7002');
+  // Check if we have any active (non-closing) 7001/7002 sessions before logging
+  const hasTargetSessions = Array.from(activeSessions.values()).some(s => !s.closing && (s.extension === '7001' || s.extension === '7002'));
   
   // Only log UDP packet details if we have 7001/7002 sessions active
   if (hasTargetSessions) {
@@ -94,7 +94,7 @@ rtpServer.on('message', (msg, rinfo) => {
         console.log(`[7001/7002] [UDP] Too short for RTP, hex=${msg.toString('hex')}`);
       }
     } else if (totalUdpPackets % 100 === 0) {
-      const targetSessionCount = Array.from(activeSessions.values()).filter(s => s.extension === '7001' || s.extension === '7002').length;
+      const targetSessionCount = Array.from(activeSessions.values()).filter(s => !s.closing && (s.extension === '7001' || s.extension === '7002')).length;
       console.log(`[7001/7002] [UDP] Total UDP packets received: ${totalUdpPackets} (${targetSessionCount} active 7001/7002 sessions)`);
     }
   }
@@ -118,22 +118,23 @@ rtpServer.on('message', (msg, rinfo) => {
   const timestamp = (msg[4] << 24) | (msg[5] << 16) | (msg[6] << 8) | msg[7];
   const ssrc = (msg[8] << 24) | (msg[9] << 16) | (msg[10] << 8) | msg[11];
   
-  // Only log packet details if we have 7001/7002 sessions active
+  // Only log packet details if we have active (non-closing) 7001/7002 sessions
   if (hasTargetSessions) {
     // Always log first few packets to debug
     const isFirstPacket = !global.rtpPacketCount;
     global.rtpPacketCount = (global.rtpPacketCount || 0) + 1;
     if (isFirstPacket || global.rtpPacketCount <= 10) {
-      console.log(`[7001/7002] [RTP] Packet #${global.rtpPacketCount}: SSRC=${ssrc}, PT=${payloadType}, Seq=${sequenceNumber}, From=${rinfo.address}:${rinfo.port}, Size=${msg.length}, ActiveSessions=${activeSessions.size}`);
+      const activeCount = Array.from(activeSessions.values()).filter(s => !s.closing).length;
+      console.log(`[7001/7002] [RTP] Packet #${global.rtpPacketCount}: SSRC=${ssrc}, PT=${payloadType}, Seq=${sequenceNumber}, From=${rinfo.address}:${rinfo.port}, Size=${msg.length}, ActiveSessions=${activeCount}`);
     }
     
     // Log every 100th packet to show we're receiving data
     if (global.rtpPacketCount % 100 === 0) {
-      const targetSessionCount = Array.from(activeSessions.values()).filter(s => s.extension === '7001' || s.extension === '7002').length;
+      const targetSessionCount = Array.from(activeSessions.values()).filter(s => !s.closing && (s.extension === '7001' || s.extension === '7002')).length;
       console.log(`[7001/7002] [RTP] Received ${global.rtpPacketCount} total packets (${targetSessionCount} active 7001/7002 sessions)`);
     }
   } else {
-    // Still count packets but don't log if no 7001/7002 sessions
+    // Still count packets but don't log if no active 7001/7002 sessions
     global.rtpPacketCount = (global.rtpPacketCount || 0) + 1;
   }
   
@@ -145,10 +146,11 @@ rtpServer.on('message', (msg, rinfo) => {
     sessionId = findSessionByAddress(rinfo.address, rinfo.port);
   }
   
-  // If still not found, try matching ANY active session
+  // If still not found, try matching ANY active (non-closing) session
   // External media can send RTP from various ports, so be flexible
-  if (!sessionId && activeSessions.size > 0) {
-    const sessions = Array.from(activeSessions.entries());
+  const activeOnlySessions = Array.from(activeSessions.entries()).filter(([_, s]) => !s.closing);
+  if (!sessionId && activeOnlySessions.length > 0) {
+    const sessions = activeOnlySessions;
     
     // If only one session, use it (most common case)
     if (sessions.length === 1) {
@@ -222,15 +224,15 @@ rtpServer.on('message', (msg, rinfo) => {
   if (sessionId) {
     const session = activeSessions.get(sessionId);
     
-    // FILTER: Only process packets for extensions 7001 and 7002
-    if (session && session.extension !== '7001' && session.extension !== '7002') {
-      // Skip packets from other extensions - don't log or process
+    // Check if session exists and is not closing - if not, skip immediately
+    if (!session || session.closing) {
+      // Session doesn't exist or is being cleaned up - ignore late-arriving packets
       return;
     }
     
-    // Check if session is being cleaned up or already closed
-    if (session && session.closing) {
-      // Session is being cleaned up - ignore late-arriving packets
+    // FILTER: Only process packets for extensions 7001 and 7002
+    if (session.extension !== '7001' && session.extension !== '7002') {
+      // Skip packets from other extensions - don't log or process
       return;
     }
     
@@ -266,28 +268,29 @@ rtpServer.on('message', (msg, rinfo) => {
       }
     } else {
       if (!sessionId) {
-        // Only log if we have active 7001/7002 sessions
-        const hasTargetSessions = Array.from(activeSessions.values()).some(s => s.extension === '7001' || s.extension === '7002');
+        // Only log if we have active (non-closing) 7001/7002 sessions
+        const hasTargetSessions = Array.from(activeSessions.values()).some(s => !s.closing && (s.extension === '7001' || s.extension === '7002'));
         if (hasTargetSessions) {
           console.log(`[7001/7002] No session found for SSRC=${ssrc}, From=${rinfo.address}:${rinfo.port}`);
         }
       } else if (!session) {
-        console.log(`[7001/7002] Session ${sessionId} not found in activeSessions`);
+        // Session was removed - this is expected during cleanup, don't log
       } else if (!session.writeStream) {
         console.log(`[7001/7002] Session ${sessionId} has no writeStream`);
       }
     }
   } else {
-    // Only log unmatched packets if we have active 7001/7002 sessions
-    const hasTargetSessions = Array.from(activeSessions.values()).some(s => s.extension === '7001' || s.extension === '7002');
+    // Only log unmatched packets if we have active (non-closing) 7001/7002 sessions
+    const hasTargetSessions = Array.from(activeSessions.values()).some(s => !s.closing && (s.extension === '7001' || s.extension === '7002'));
     
     if (!hasTargetSessions) {
-      // No 7001/7002 sessions active - silently ignore all unmatched packets
+      // No active 7001/7002 sessions - silently ignore all unmatched packets
       return;
     }
     
-    // Log unmatched packets only if we have 7001/7002 sessions (might be for them)
-    if (activeSessions.size === 0) {
+    // Log unmatched packets only if we have active 7001/7002 sessions (might be for them)
+    const activeCount = Array.from(activeSessions.values()).filter(s => !s.closing).length;
+    if (activeCount === 0) {
       // Log first few unmatched packets when no sessions exist
       if (global.unmatchedPacketCount === undefined) {
         global.unmatchedPacketCount = 0;
@@ -298,11 +301,11 @@ rtpServer.on('message', (msg, rinfo) => {
         console.log(`  → No active sessions! Packets arriving but no call in progress.`);
       }
     } else {
-      // Log occasionally when we have sessions but can't match
+      // Log occasionally when we have active sessions but can't match
       if (Math.random() < 0.01) {
-        const targetSessions = Array.from(activeSessions.entries()).filter(([_, s]) => s.extension === '7001' || s.extension === '7002');
+        const targetSessions = Array.from(activeSessions.entries()).filter(([_, s]) => !s.closing && (s.extension === '7001' || s.extension === '7002'));
         console.log(`[7001/7002] ⚠ Unmatched RTP packet: SSRC=${ssrc}, PT=${payloadType}, From=${rinfo.address}:${rinfo.port}`);
-        console.log(`  → Active 7001/7002 sessions:`, targetSessions.map(([id, s]) => `${id} (${s.extension})`));
+        console.log(`  → Active 7001/7002 sessions:`, targetSessions.map(([id, s]) => `${id.substring(0, 8)}... (${s.extension})`));
         console.log(`  → Session SSRCs:`, targetSessions.map(([_, s]) => {
           if (s.ssrcs && s.ssrcs.length > 0) {
             return s.ssrcs.join(',');
@@ -314,7 +317,7 @@ rtpServer.on('message', (msg, rinfo) => {
         for (const [sid, sess] of targetSessions) {
           if (sess.ssrcs && sess.ssrcs.length === 1 && !sess.ssrcs.includes(ssrc)) {
             sess.ssrcs.push(ssrc);
-            console.log(`  → ✓ Auto-matched SSRC ${ssrc} to session ${sid} as second SSRC (bidirectional audio)`);
+            console.log(`  → ✓ Auto-matched SSRC ${ssrc} to session ${sid.substring(0, 8)}... as second SSRC (bidirectional audio)`);
             sessionId = sid;
             break;
           }
@@ -391,21 +394,21 @@ function convertPCMAtoPCM(pcmaData) {
   return pcmData;
 }
 
-// Find session by SSRC
+// Find session by SSRC (skip closing sessions)
 function findSessionBySSRC(ssrc) {
   for (const [sessionId, session] of activeSessions.entries()) {
-    if (session.ssrc === ssrc) {
+    if (!session.closing && session.ssrc === ssrc) {
       return sessionId;
     }
   }
   return null;
 }
 
-// Find session by RTP address
+// Find session by RTP address (skip closing sessions)
 function findSessionByAddress(address, port) {
   for (const [sessionId, session] of activeSessions.entries()) {
-    // Match by port (since address might vary due to NAT)
-    if (session.rtpPort === port) {
+    // Match by port (since address might vary due to NAT) and skip closing sessions
+    if (!session.closing && session.rtpPort === port) {
       return sessionId;
     }
   }
@@ -414,11 +417,14 @@ function findSessionByAddress(address, port) {
 
 // Log session status periodically
 function logSessionStatus() {
-  if (activeSessions.size > 0) {
+  // Filter out closing sessions - only show active ones
+  const activeOnly = Array.from(activeSessions.entries()).filter(([_, session]) => !session.closing);
+  
+  if (activeOnly.length > 0) {
     console.log(`\n╔════════════════════════════════════════════════════════════╗`);
     console.log(`║           ACTIVE SESSIONS STATUS (Every 5s)                ║`);
     console.log(`╚════════════════════════════════════════════════════════════╝`);
-    for (const [sessionId, session] of activeSessions.entries()) {
+    for (const [sessionId, session] of activeOnly) {
       const duration = session.startTime ? ((new Date() - session.startTime) / 1000) : 0;
       console.log(`\nSession: ${sessionId.substring(0, 8)}...`);
       console.log(`  Extension: ${session.extension}`);
@@ -463,7 +469,7 @@ function logSessionStatus() {
       }
     }
     console.log(`\nTotal UDP packets received by server: ${totalUdpPackets || 0}`);
-    if (totalUdpPackets === 0 && activeSessions.size > 0) {
+    if (totalUdpPackets === 0 && activeOnly.length > 0) {
       console.log(`  ❌ NO UDP packets received at all - check network/firewall!`);
     }
     console.log(`════════════════════════════════════════════════════════════\n`);
@@ -1234,7 +1240,10 @@ async function cleanupSession(sessionId) {
   
   // Mark session as closing IMMEDIATELY to prevent processing late-arriving packets
   session.closing = true;
-  console.log(`[7001/7002] Session ${sessionId} marked as closing - ignoring late packets`);
+  
+  // Remove from activeSessions IMMEDIATELY to stop all packet processing and logging
+  activeSessions.delete(sessionId);
+  console.log(`[7001/7002] Session ${sessionId} removed from active sessions - ignoring late packets`);
   
   try {
     // Bridge cleanup is handled in StasisEnd handler, no need to destroy here
@@ -1285,15 +1294,10 @@ async function cleanupSession(sessionId) {
       console.log(`Warning: Recording file ${session.wavPath} does not exist`);
     }
     
-    activeSessions.delete(sessionId);
+    // Session already removed from activeSessions at the start of cleanup
   } catch (error) {
     console.error(`Error cleaning up session ${sessionId}:`, error.message || error);
-    // Ensure session is removed even on error
-    try {
-      activeSessions.delete(sessionId);
-    } catch (e) {
-      // Ignore
-    }
+    // Session already removed from activeSessions at the start of cleanup
   }
 }
 
