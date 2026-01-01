@@ -1,0 +1,1203 @@
+const express = require('express');
+const ari = require('ari-client');
+const dgram = require('dgram');
+const fs = require('fs-extra');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const { Transform } = require('stream');
+const http = require('http');
+
+const app = express();
+app.use(express.json());
+
+// Configuration
+// Default to localhost for local development, Docker will override via env vars
+const ARI_URL = process.env.ARI_URL || 'http://139.59.15.144:8088/ari';
+const ARI_USERNAME = process.env.ARI_USERNAME || 'asterisk';
+const ARI_PASSWORD = process.env.ARI_PASSWORD || 'asterisk123';
+const RTP_PORT = parseInt(process.env.RTP_PORT || '20000');
+const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(__dirname, '..', 'recordings');
+
+// Determine RTP server address - use IP address that Asterisk can reach
+// If running locally, use the Asterisk server's IP or localhost
+// If running in Docker, use the Docker hostname
+function getRTPServerAddress() {
+  if (process.env.RTP_SERVER_ADDRESS) {
+    return process.env.RTP_SERVER_ADDRESS;
+  }
+  
+  // Extract IP from ARI_URL if available
+  try {
+    const ariUrlObj = new URL(ARI_URL);
+    const asteriskHost = ariUrlObj.hostname;
+    
+    // If ARI URL uses an IP address, use that for RTP
+    if (asteriskHost && asteriskHost !== 'localhost' && asteriskHost !== '127.0.0.1') {
+      // For remote Asterisk, RTP server should be accessible from Asterisk's perspective
+      // Use the same IP or detect if we're on the same network
+      return asteriskHost; // Use Asterisk's IP - RTP server should be reachable from there
+    }
+  } catch (e) {
+    // Ignore URL parsing errors
+  }
+  
+  // Default fallback
+  return 'localhost';
+}
+
+// Ensure recordings directory exists
+try {
+  fs.ensureDirSync(RECORDINGS_DIR);
+  console.log(`Recordings directory: ${RECORDINGS_DIR}`);
+} catch (error) {
+  console.error(`Failed to create recordings directory at ${RECORDINGS_DIR}:`, error.message);
+  process.exit(1);
+}
+
+// Store active RTP sessions
+const activeSessions = new Map();
+
+// RTP Server - listens for RTP packets
+const rtpServer = dgram.createSocket('udp4');
+
+// Track ALL UDP packets received (not just RTP)
+let totalUdpPackets = 0;
+
+rtpServer.on('message', (msg, rinfo) => {
+  totalUdpPackets++;
+  
+  // Log ALL UDP packets for first 20 packets to debug
+  if (totalUdpPackets <= 20) {
+    console.log(`\n[UDP] Packet #${totalUdpPackets}: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
+    if (msg.length >= 12) {
+      const firstByte = msg[0];
+      const version = (firstByte >> 6) & 0x3;
+      const payloadType = msg[1] & 0x7f;
+      console.log(`[UDP] Looks like RTP: version=${version}, PT=${payloadType}, hex=${msg.slice(0, 12).toString('hex')}`);
+    } else {
+      console.log(`[UDP] Too short for RTP, hex=${msg.toString('hex')}`);
+    }
+  } else if (totalUdpPackets % 100 === 0) {
+    console.log(`[UDP] Total UDP packets received: ${totalUdpPackets}`);
+  }
+  
+  // RTP packet structure: 12 bytes header + payload
+  if (msg.length < 12) {
+    if (totalUdpPackets <= 20) {
+      console.log(`[UDP] Packet too short for RTP: ${msg.length} bytes from ${rinfo.address}:${rinfo.port}`);
+    }
+    return;
+  }
+  
+  // Parse RTP header
+  const version = (msg[0] >> 6) & 0x3;
+  const padding = (msg[0] >> 5) & 0x1;
+  const extension = (msg[0] >> 4) & 0x1;
+  const csrcCount = msg[0] & 0xf;
+  const marker = (msg[1] >> 7) & 0x1;
+  const payloadType = msg[1] & 0x7f;
+  const sequenceNumber = (msg[2] << 8) | msg[3];
+  const timestamp = (msg[4] << 24) | (msg[5] << 16) | (msg[6] << 8) | msg[7];
+  const ssrc = (msg[8] << 24) | (msg[9] << 16) | (msg[10] << 8) | msg[11];
+  
+  // Always log first few packets to debug
+  const isFirstPacket = !global.rtpPacketCount;
+  global.rtpPacketCount = (global.rtpPacketCount || 0) + 1;
+  if (isFirstPacket || global.rtpPacketCount <= 10) {
+    console.log(`[RTP] Packet #${global.rtpPacketCount}: SSRC=${ssrc}, PT=${payloadType}, Seq=${sequenceNumber}, From=${rinfo.address}:${rinfo.port}, Size=${msg.length}, ActiveSessions=${activeSessions.size}`);
+  }
+  
+  // Log every 100th packet to show we're receiving data
+  if (global.rtpPacketCount % 100 === 0) {
+    console.log(`[RTP] Received ${global.rtpPacketCount} total packets`);
+  }
+  
+  // Find session by SSRC or address
+  let sessionId = findSessionBySSRC(ssrc);
+  if (!sessionId) {
+    sessionId = findSessionByAddress(rinfo.address, rinfo.port);
+  }
+  
+  // If still not found, try matching by port only (for external media)
+  // External media sends RTP to our server on RTP_PORT
+  if (!sessionId) {
+    // Try to find any active session that matches the port
+    const sessions = Array.from(activeSessions.entries());
+    for (const [sid, sess] of sessions) {
+      // Match by port - external media sends to our RTP_PORT
+      if (rinfo.port === sess.rtpPort || rinfo.port === RTP_PORT) {
+        sessionId = sid;
+        const session = sess;
+        // Update session with SSRC if not set
+        if (!session.ssrc) {
+          session.ssrc = ssrc;
+          console.log(`✓ Matched RTP packet by port ${rinfo.port}, assigned SSRC ${ssrc} to session ${sessionId}`);
+        } else if (session.ssrc === ssrc) {
+          // SSRC matches, use this session
+          sessionId = sid;
+          break;
+        }
+      }
+    }
+  }
+  
+  // Last resort: if only one active session, use it
+  if (!sessionId && activeSessions.size === 1) {
+    const sessions = Array.from(activeSessions.entries());
+    sessionId = sessions[0][0];
+    const session = sessions[0][1];
+    if (!session.ssrc) {
+      session.ssrc = ssrc;
+      console.log(`✓ Using only active session, assigned SSRC ${ssrc} to session ${sessionId}`);
+    }
+  }
+  
+  if (sessionId) {
+    const session = activeSessions.get(sessionId);
+    if (session && session.writeStream) {
+      // Extract payload (skip 12 byte header + CSRC if present)
+      const payloadOffset = 12 + (csrcCount * 4);
+      if (msg.length > payloadOffset) {
+        const payload = msg.slice(payloadOffset);
+        
+        // Convert PCMU (G.711 μ-law) to PCM
+        if (payloadType === 0 || session.codec === 'PCMU') {
+          const pcmData = convertPCMUtoPCM(payload);
+          if (pcmData) {
+            session.writeStream.write(pcmData);
+            session.packetCount = (session.packetCount || 0) + 1;
+            if (session.packetCount === 1 || session.packetCount % 100 === 0) {
+              console.log(`Session ${sessionId}: Received ${session.packetCount} packets, SSRC=${ssrc}`);
+            }
+          }
+        } else if (payloadType === 8 || session.codec === 'PCMA') {
+          // PCMA (G.711 A-law)
+          const pcmData = convertPCMAtoPCM(payload);
+          if (pcmData) {
+            session.writeStream.write(pcmData);
+            session.packetCount = (session.packetCount || 0) + 1;
+            if (session.packetCount === 1 || session.packetCount % 100 === 0) {
+              console.log(`Session ${sessionId}: Received ${session.packetCount} packets, SSRC=${ssrc}`);
+            }
+          }
+        } else {
+          console.log(`Session ${sessionId}: Unsupported payload type ${payloadType}`);
+        }
+      }
+    } else {
+      if (!sessionId) {
+        console.log(`No session found for SSRC=${ssrc}, From=${rinfo.address}:${rinfo.port}`);
+      } else if (!session) {
+        console.log(`Session ${sessionId} not found in activeSessions`);
+      } else if (!session.writeStream) {
+        console.log(`Session ${sessionId} has no writeStream`);
+      }
+    }
+  } else {
+    // Log unmatched packets occasionally
+    if (Math.random() < 0.01) { // Log 1% of unmatched packets
+      console.log(`Unmatched RTP packet: SSRC=${ssrc}, PT=${payloadType}, From=${rinfo.address}:${rinfo.port}, Active sessions: ${activeSessions.size}`);
+    }
+  }
+});
+
+rtpServer.on('error', (err) => {
+  console.error('RTP Server error:', err.message || err);
+  // Don't crash - RTP server errors are recoverable
+});
+
+rtpServer.bind(RTP_PORT, '0.0.0.0', () => {
+  console.log(`✓ RTP Server listening on UDP port ${RTP_PORT} on all interfaces (0.0.0.0)`);
+  console.log(`  Waiting for RTP packets from Asterisk...`);
+  console.log(`\n  ⚠ IMPORTANT: If no packets arrive, check:`);
+  console.log(`    1. Firewall allows UDP port ${RTP_PORT}`);
+  console.log(`    2. Asterisk can reach this server at ${getRTPServerAddress()}:${RTP_PORT}`);
+  console.log(`    3. External media channel is added to bridge`);
+  console.log(`    4. Call is actually connected (Dial() answered)`);
+  console.log(`    5. External media channel is receiving audio in bridge\n`);
+  
+  // Test: Log when server is ready
+  console.log(`  To test connectivity from Asterisk server, run:`);
+  console.log(`    echo "test" | nc -u ${getRTPServerAddress()} ${RTP_PORT}`);
+  console.log(`  You should see [UDP] Packet logs if connectivity is OK\n`);
+});
+
+// G.711 μ-law to PCM conversion table
+const mulawTable = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  let sign = (i & 0x80) ? -1 : 1;
+  let exponent = (i & 0x70) >> 4;
+  let mantissa = i & 0x0f;
+  let sample = mantissa << (exponent + 3);
+  if (exponent !== 0) sample += (0x84 << exponent);
+  mulawTable[i] = sign * sample;
+}
+
+// Convert PCMU (μ-law) to PCM
+function convertPCMUtoPCM(pcmuData) {
+  const pcmData = Buffer.alloc(pcmuData.length * 2);
+  for (let i = 0; i < pcmuData.length; i++) {
+    const pcmValue = mulawTable[pcmuData[i]];
+    pcmData.writeInt16LE(pcmValue, i * 2);
+  }
+  return pcmData;
+}
+
+// G.711 A-law to PCM conversion table
+const alawTable = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  let sign = (i & 0x80) ? -1 : 1;
+  let exponent = (i & 0x70) >> 4;
+  let mantissa = i & 0x0f;
+  let sample;
+  if (exponent === 0) {
+    sample = (mantissa << 4) + 8;
+  } else {
+    sample = ((mantissa << 4) + 0x108) << (exponent - 1);
+  }
+  alawTable[i] = sign * sample;
+}
+
+// Convert PCMA (A-law) to PCM
+function convertPCMAtoPCM(pcmaData) {
+  const pcmData = Buffer.alloc(pcmaData.length * 2);
+  for (let i = 0; i < pcmaData.length; i++) {
+    const pcmValue = alawTable[pcmaData[i] ^ 0x55]; // A-law uses XOR
+    pcmData.writeInt16LE(pcmValue, i * 2);
+  }
+  return pcmData;
+}
+
+// Find session by SSRC
+function findSessionBySSRC(ssrc) {
+  for (const [sessionId, session] of activeSessions.entries()) {
+    if (session.ssrc === ssrc) {
+      return sessionId;
+    }
+  }
+  return null;
+}
+
+// Find session by RTP address
+function findSessionByAddress(address, port) {
+  for (const [sessionId, session] of activeSessions.entries()) {
+    // Match by port (since address might vary due to NAT)
+    if (session.rtpPort === port) {
+      return sessionId;
+    }
+  }
+  return null;
+}
+
+// Log session status periodically
+function logSessionStatus() {
+  if (activeSessions.size > 0) {
+    console.log(`\n╔════════════════════════════════════════════════════════════╗`);
+    console.log(`║           ACTIVE SESSIONS STATUS (Every 5s)                ║`);
+    console.log(`╚════════════════════════════════════════════════════════════╝`);
+    for (const [sessionId, session] of activeSessions.entries()) {
+      const duration = session.startTime ? ((new Date() - session.startTime) / 1000) : 0;
+      console.log(`\nSession: ${sessionId.substring(0, 8)}...`);
+      console.log(`  Extension: ${session.extension}`);
+      console.log(`  SSRC: ${session.ssrc || '❌ not set'}`);
+      console.log(`  RTP Packets: ${session.packetCount || 0} ${session.packetCount > 0 ? '✓' : '❌'}`);
+      console.log(`  Duration: ${duration.toFixed(2)}s`);
+      console.log(`  Bridge ID: ${session.bridgeId || '❌ NOT IN BRIDGE'}`);
+      console.log(`  RTP Target: ${session.rtpAddress}:${session.rtpPort}`);
+      
+      // Critical warnings
+      if (session.packetCount === 0 && duration > 3) {
+        console.log(`\n  ⚠⚠⚠ CRITICAL: No RTP packets received after ${duration.toFixed(1)}s! ⚠⚠⚠`);
+        console.log(`     Possible issues:`);
+        console.log(`     1. External media channel not in bridge`);
+        console.log(`     2. Asterisk cannot reach ${session.rtpAddress}:${session.rtpPort}`);
+        console.log(`     3. Firewall blocking UDP port ${session.rtpPort}`);
+        console.log(`     4. Call not connected (Dial() not answered)`);
+        console.log(`     5. External media channel not receiving audio from bridge`);
+        
+        // Try to check bridge status (async, won't block)
+        if (session.bridgeId && ariClient) {
+          ariClient.bridges.get({ bridgeId: session.bridgeId }).then(bridgeInfo => {
+            console.log(`     Bridge ${session.bridgeId} channels:`, bridgeInfo.channels || []);
+            // Find channel info for this session
+            for (const [chId, chInfo] of channelsToRecord.entries()) {
+              if (chInfo.sessionId === sessionId && bridgeInfo.channels) {
+                if (bridgeInfo.channels.includes(chInfo.externalMediaId)) {
+                  console.log(`     ✓ External media channel ${chInfo.externalMediaId} IS in bridge`);
+                } else {
+                  console.log(`     ❌ External media channel ${chInfo.externalMediaId} NOT in bridge!`);
+                }
+                break;
+              }
+            }
+          }).catch(err => {
+            console.log(`     Could not check bridge status: ${err.message || err}`);
+          });
+        }
+      } else if (session.packetCount > 0) {
+        const packetsPerSecond = duration > 0 ? (session.packetCount / duration).toFixed(1) : '0';
+        console.log(`  ✓ Recording active: ${packetsPerSecond} packets/sec`);
+      }
+    }
+    console.log(`\nTotal UDP packets received by server: ${totalUdpPackets || 0}`);
+    if (totalUdpPackets === 0 && activeSessions.size > 0) {
+      console.log(`  ❌ NO UDP packets received at all - check network/firewall!`);
+    }
+    console.log(`════════════════════════════════════════════════════════════\n`);
+  }
+}
+
+// Log session status every 5 seconds (more frequent for debugging)
+setInterval(logSessionStatus, 5000);
+
+// Create WAV file writer
+function createWAVWriter(filePath, sampleRate = 8000, channels = 1, bitDepth = 16) {
+  const fileStream = fs.createWriteStream(filePath);
+  
+  // WAV header
+  const header = Buffer.alloc(44);
+  header.write('RIFF', 0);
+  header.writeUInt32LE(0, 4); // File size (will be updated later)
+  header.write('WAVE', 8);
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16); // fmt chunk size
+  header.writeUInt16LE(1, 20); // Audio format (PCM)
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * channels * (bitDepth / 8), 28); // Byte rate
+  header.writeUInt16LE(channels * (bitDepth / 8), 32); // Block align
+  header.writeUInt16LE(bitDepth, 34);
+  header.write('data', 36);
+  header.writeUInt32LE(0, 40); // Data size (will be updated later)
+  
+  fileStream.write(header);
+  
+  let dataSize = 0;
+  let headerUpdated = false;
+  
+  const writeStream = new Transform({
+    transform(chunk, encoding, callback) {
+      try {
+        dataSize += chunk.length;
+        if (fileStream && !fileStream.destroyed && fileStream.writable) {
+          fileStream.write(chunk);
+        }
+        callback();
+      } catch (err) {
+        console.error('Error in writeStream transform:', err.message || err);
+        callback(err);
+      }
+    },
+    flush(callback) {
+      // Handle flush safely with error handling
+      try {
+        // Close the file stream first
+        fileStream.end(() => {
+          try {
+            // Update file size and data size in header by reading and rewriting
+            fs.readFile(filePath, (err, data) => {
+              if (err) {
+                console.error('Error reading file to update header:', err.message || err);
+                callback();
+                return;
+              }
+              
+              try {
+                // Update header in buffer
+                const fileSize = 36 + dataSize;
+                data.writeUInt32LE(fileSize, 4);
+                data.writeUInt32LE(dataSize, 40);
+                
+                // Write updated header back
+                fs.writeFile(filePath, data, (writeErr) => {
+                  if (writeErr) {
+                    console.error('Error writing updated header:', writeErr.message || writeErr);
+                  }
+                  callback();
+                });
+              } catch (bufferErr) {
+                console.error('Error updating WAV header buffer:', bufferErr.message || bufferErr);
+                callback();
+              }
+            });
+          } catch (readErr) {
+            console.error('Error in file read operation:', readErr.message || readErr);
+            callback();
+          }
+        });
+      } catch (flushErr) {
+        console.error('Error in flush operation:', flushErr.message || flushErr);
+        callback();
+      }
+    }
+  });
+  
+  return { writeStream, fileStream };
+}
+
+// Convert WAV to MP3 using ffmpeg (if available) or keep as WAV
+async function convertToMP3(wavPath, mp3Path) {
+  // For now, we'll save as WAV. In production, use ffmpeg or a proper library
+  // You can add ffmpeg conversion here if needed
+  // Skip conversion for now - just return the WAV path
+  // TODO: Implement actual MP3 conversion using ffmpeg or similar
+  return wavPath;
+}
+
+// Initialize ARI client
+let ariClient = null;
+
+// Check if ARI is available
+async function checkARIReady() {
+  return new Promise((resolve) => {
+    try {
+      const url = new URL(ARI_URL);
+      const options = {
+        hostname: url.hostname,
+        port: url.port || 8088,
+        path: '/ari/asterisk/info',
+        method: 'GET',
+        auth: `${ARI_USERNAME}:${ARI_PASSWORD}`,
+        timeout: 3000
+      };
+      
+      const req = http.request(options, (res) => {
+        let data = '';
+        res.on('data', (chunk) => {
+          data += chunk;
+        });
+        res.on('end', () => {
+          if (res.statusCode === 200) {
+            console.log(`✓ ARI connection successful to ${url.hostname}:${options.port}`);
+            resolve(true);
+          } else {
+            console.log(`✗ ARI returned status ${res.statusCode} (expected 200)`);
+            resolve(false);
+          }
+        });
+      });
+      
+      req.on('error', (error) => {
+        console.log(`✗ ARI connection error: ${error.code || error.message} (${url.hostname}:${options.port})`);
+        resolve(false);
+      });
+      
+      req.on('timeout', () => {
+        console.log(`✗ ARI connection timeout (${url.hostname}:${options.port})`);
+        req.destroy();
+        resolve(false);
+      });
+      
+      req.end();
+    } catch (error) {
+      console.log(`✗ ARI URL parsing error: ${error.message}`);
+      console.log(`  ARI_URL: ${ARI_URL}`);
+      resolve(false);
+    }
+  });
+}
+
+// Wait for ARI to be ready
+async function waitForARI(maxAttempts = 60, delay = 5000) {
+  console.log('='.repeat(60));
+  console.log('RTP Server Configuration:');
+  console.log(`  ARI URL: ${ARI_URL}`);
+  console.log(`  ARI Username: ${ARI_USERNAME}`);
+  console.log(`  RTP Port: ${RTP_PORT}`);
+  console.log(`  Recordings Directory: ${RECORDINGS_DIR}`);
+  console.log('='.repeat(60));
+  console.log(`Connecting to ARI...`);
+  
+  for (let i = 0; i < maxAttempts; i++) {
+    const ready = await checkARIReady();
+    if (ready) {
+      console.log('✓ Asterisk ARI is ready!');
+      return true;
+    }
+    
+    if (i < maxAttempts - 1) {
+      console.log(`Waiting ${delay / 1000}s before retry... (attempt ${i + 1}/${maxAttempts})`);
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  
+  console.error(`✗ Failed to connect to ARI after ${maxAttempts} attempts`);
+  console.error(`  Check that Asterisk is running and ARI is enabled`);
+  console.error(`  ARI_URL: ${ARI_URL}`);
+  console.error(`  Verify http://${new URL(ARI_URL).hostname}:${new URL(ARI_URL).port || 8088}/ari/asterisk/info is accessible`);
+  return false;
+}
+
+async function connectARI() {
+  try {
+    // Wait for ARI to be ready
+    const ready = await waitForARI();
+    if (!ready) {
+      throw new Error('Asterisk ARI is not available after waiting');
+    }
+    
+    // Try to connect with retries
+    let retries = 5;
+    let connected = false;
+    while (retries > 0 && !connected) {
+      try {
+        console.log(`Attempting to connect to ARI (${6 - retries}/5)...`);
+        // Wrap ari.connect in a Promise to catch all errors
+        ariClient = await new Promise((resolve, reject) => {
+          ari.connect(ARI_URL, ARI_USERNAME, ARI_PASSWORD)
+            .then(client => resolve(client))
+            .catch(err => reject(err));
+        });
+        console.log('Connected to Asterisk ARI');
+        connected = true;
+      } catch (error) {
+        retries--;
+        const errorMsg = error.message || error.toString();
+        console.log(`ARI connection failed: ${errorMsg}`);
+        if (retries === 0) {
+          throw new Error(`Failed to connect to ARI after 5 attempts: ${errorMsg}`);
+        }
+        console.log(`Retrying in 3 seconds... (${retries} attempts remaining)`);
+        await new Promise(resolve => setTimeout(resolve, 3000));
+      }
+    }
+
+    // Track channels that need recording
+    const channelsToRecord = new Map();
+    
+    // Set up Stasis application - just set up recording, then continue in dialplan
+    ariClient.on('StasisStart', async (event, channel) => {
+      console.log(`Channel ${channel.id} entered Stasis application`);
+      const extension = channel.dialplan?.exten || 'unknown';
+      console.log(`Channel destination: ${extension}`);
+      
+      // Only handle extensions 7001 and 7002
+      if (extension !== '7001' && extension !== '7002') {
+        // Continue in dialplan for other extensions
+        await channel.continueInDialplan();
+        return;
+      }
+      
+      try {
+        // Channel is already answered in dialplan
+        // Set up recording session
+        const sessionId = uuidv4();
+        const rtpPort = RTP_PORT;
+        const rtpAddress = getRTPServerAddress();
+        
+        const wavPath = path.join(RECORDINGS_DIR, `${sessionId}.wav`);
+        const { writeStream, fileStream } = createWAVWriter(wavPath, 8000, 1, 16);
+        
+        // Store session
+        activeSessions.set(sessionId, {
+          channelId: channel.id,
+          rtpAddress: rtpAddress,
+          rtpPort: rtpPort,
+          codec: 'PCMU',
+          writeStream: writeStream,
+          fileStream: fileStream,
+          wavPath: wavPath,
+          startTime: new Date(),
+          packetCount: 0,
+          ssrc: null,
+          extension: extension
+        });
+        
+        console.log(`Created RTP session ${sessionId} for extension ${extension} on ${rtpAddress}:${rtpPort}`);
+        
+        // Create external media channel using ARI for recording
+        let externalMedia;
+        try {
+          // Try creating external media channel
+          // Format: external_host should be "host:port" or "host/port"
+          const externalHost = `${rtpAddress}:${rtpPort}`;
+          console.log(`Creating external media channel with host: ${externalHost}`);
+          
+          externalMedia = await ariClient.channels.externalMedia({
+            app: 'rtp-recorder',
+            external_host: externalHost,
+            format: 'ulaw', // PCMU
+            channelId: `external-${sessionId}`
+          });
+          
+          console.log(`Created external media channel: ${externalMedia.id}`);
+          
+          // External media channel is created with RTP target - simple!
+          // We'll add it to Dial()'s bridge when Dial() creates it
+          // No need to create our own bridge - Dial() handles the call bridge
+          
+          // Get channel details to extract SSRC (for packet matching)
+          try {
+            const channelDetails = await ariClient.channels.get({ channelId: externalMedia.id });
+            console.log(`External media channel state: ${channelDetails.state}`);
+            
+            if (channelDetails.channelvars) {
+              const rtpLocalSSRC = channelDetails.channelvars.RTP_LOCAL_SSRC;
+              if (rtpLocalSSRC) {
+                const session = activeSessions.get(sessionId);
+                if (session) {
+                  session.ssrc = parseInt(rtpLocalSSRC);
+                  console.log(`Set SSRC ${session.ssrc} for session ${sessionId}`);
+                }
+              }
+            }
+          } catch (detailsError) {
+            console.log(`Note: Could not get channel details: ${detailsError.message || 'Unknown error'}`);
+          }
+        } catch (externalMediaError) {
+          console.error(`Error creating external media channel:`, externalMediaError);
+          const errorMsg = externalMediaError.message || JSON.stringify(externalMediaError);
+          console.error(`Error details: ${errorMsg}`);
+          
+          // Clean up session resources safely
+          try {
+            const session = activeSessions.get(sessionId);
+            if (session) {
+              // Close streams safely
+              if (session.writeStream) {
+                try {
+                  session.writeStream.destroy();
+                } catch (e) {
+                  // Ignore
+                }
+              }
+              if (session.fileStream) {
+                try {
+                  session.fileStream.destroy();
+                } catch (e) {
+                  // Ignore
+                }
+              }
+              // Delete incomplete WAV file if it exists
+              try {
+                if (fs.existsSync(session.wavPath)) {
+                  fs.unlinkSync(session.wavPath);
+                }
+              } catch (e) {
+                // Ignore
+              }
+            }
+            activeSessions.delete(sessionId);
+          } catch (cleanupErr) {
+            console.error(`Error during cleanup:`, cleanupErr);
+          }
+          
+          // If external media fails, we can't record, but continue with call
+          console.log(`Recording unavailable (${errorMsg}), continuing call without recording`);
+          console.log(`Note: If running locally, ensure RTP server at ${rtpAddress}:${rtpPort} is accessible from Asterisk`);
+          try {
+            await channel.continueInDialplan();
+          } catch (continueError) {
+            console.error(`Error continuing in dialplan:`, continueError);
+            try {
+              await channel.hangup();
+            } catch (hangupError) {
+              console.error(`Error hanging up channel:`, hangupError);
+            }
+          }
+          return;
+        }
+        
+        // Store channel info for bridge monitoring
+        channelsToRecord.set(channel.id, {
+          sessionId: sessionId,
+          externalMediaId: externalMedia.id,
+          extension: extension
+        });
+        
+        console.log(`\n=== External Media Channel Created ===`);
+        console.log(`External Media Channel ID: ${externalMedia.id}`);
+        console.log(`RTP Target: ${rtpAddress}:${rtpPort}`);
+        console.log(`Format: ulaw (PCMU)`);
+        console.log(`\n✓ External media channel ready`);
+        console.log(`  Will add to Dial() bridge when call connects`);
+        console.log(`  External media provides bidirectional RTP stream - simple!\n`);
+        
+        // Continue channel in dialplan - Dial() will create its bridge
+        // We'll add external media channel to Dial's bridge via BridgeCreated event
+        await channel.continueInDialplan();
+        
+        // Handle channel hangup
+        channel.on('ChannelHangupRequest', async () => {
+          const channelInfo = channelsToRecord.get(channel.id);
+          if (channelInfo) {
+            await cleanupSession(channelInfo.sessionId);
+            channelsToRecord.delete(channel.id);
+          }
+        });
+        
+        externalMedia.on('ChannelHangupRequest', async () => {
+          const channelInfo = channelsToRecord.get(channel.id);
+          if (channelInfo) {
+            await cleanupSession(channelInfo.sessionId);
+            channelsToRecord.delete(channel.id);
+          }
+        });
+        
+      } catch (error) {
+        console.error('Error in StasisStart:', error);
+        try {
+          await channel.continueInDialplan();
+        } catch (e) {
+          // Ignore
+        }
+      }
+    });
+    
+    // Monitor for bridges created by Dial() and add external media channel
+    // This is the key: External media channel must be in the same bridge as the active call
+    ariClient.on('BridgeCreated', async (event, bridge) => {
+      console.log(`\n=== Bridge Created Event (Dial() bridge) ===`);
+      console.log(`Bridge ID: ${bridge.id}`);
+      console.log(`Bridge Type: ${bridge.bridge_type || 'N/A'}`);
+      console.log(`Bridge channels:`, bridge.channels || []);
+      
+      // Check if any channel in this bridge needs recording
+      if (bridge.channels && bridge.channels.length > 0) {
+        for (const channelId of bridge.channels) {
+          const channelInfo = channelsToRecord.get(channelId);
+          if (channelInfo) {
+            console.log(`\n✓✓✓ Found channel ${channelId} in Dial() bridge ${bridge.id} ✓✓✓`);
+            console.log(`  Adding external media channel ${channelInfo.externalMediaId} to this bridge`);
+            console.log(`  This will enable RTP streaming to ${getRTPServerAddress()}:${RTP_PORT}\n`);
+            
+            // Retry logic: external media channel might not be immediately available
+            let retries = 5;
+            let added = false;
+            
+            while (retries > 0 && !added) {
+              try {
+                // Wait a moment for the bridge and channel to be fully ready
+                await new Promise(resolve => setTimeout(resolve, 300));
+                
+                // First, verify the external media channel still exists
+                try {
+                  const extChannel = await ariClient.channels.get({ channelId: channelInfo.externalMediaId });
+                  console.log(`External media channel ${channelInfo.externalMediaId} exists, state: ${extChannel.state}`);
+                } catch (channelErr) {
+                  console.warn(`External media channel ${channelInfo.externalMediaId} not found, retrying... (${retries} attempts left)`);
+                  retries--;
+                  await new Promise(resolve => setTimeout(resolve, 500));
+                  continue;
+                }
+                
+                // Get bridge object using the bridge ID
+                const bridgeObj = ariClient.Bridge();
+                bridgeObj.id = bridge.id;
+                
+                // Add external media recording channel to the bridge
+                await bridgeObj.addChannel({ channel: channelInfo.externalMediaId });
+                console.log(`✓ Added recording channel ${channelInfo.externalMediaId} to bridge ${bridge.id}`);
+                added = true;
+                
+                // Verify it was added
+                try {
+                  const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
+                  console.log(`Bridge ${bridge.id} now has channels:`, bridgeInfo.channels || []);
+                  
+                  // Verify external media channel is in the bridge
+                  if (bridgeInfo.channels && bridgeInfo.channels.includes(channelInfo.externalMediaId)) {
+                    console.log(`✓ Confirmed: External media channel ${channelInfo.externalMediaId} is in bridge ${bridge.id}`);
+                  } else {
+                    console.warn(`⚠ Warning: External media channel ${channelInfo.externalMediaId} not found in bridge channels`);
+                  }
+                } catch (verifyErr) {
+                  console.error(`Error verifying bridge:`, verifyErr.message || verifyErr);
+                }
+                
+                // Store bridge ID in session
+                const session = activeSessions.get(channelInfo.sessionId);
+                if (session) {
+                  session.bridgeId = bridge.id;
+                  console.log(`Session ${channelInfo.sessionId} is now recording from bridge ${bridge.id}`);
+                }
+                
+                // Monitor bridge destruction
+                bridgeObj.on('BridgeDestroyed', async () => {
+                  console.log(`Bridge ${bridge.id} destroyed, cleaning up session ${channelInfo.sessionId}`);
+                  await cleanupSession(channelInfo.sessionId);
+                  channelsToRecord.delete(channelId);
+                });
+                
+              } catch (err) {
+                retries--;
+                const errorMsg = err.message || JSON.stringify(err);
+                if (retries > 0) {
+                  console.log(`  Retry ${6 - retries}/5: ${errorMsg}`);
+                  await new Promise(resolve => setTimeout(resolve, 300));
+                } else {
+                  console.error(`\n❌ FAILED: Could not add external media channel after 5 retries`);
+                  console.error(`  Error: ${errorMsg}`);
+                  console.error(`  Recording will NOT work for this call\n`);
+                  if (err.response) {
+                    console.error(`  Error response:`, err.response.status, err.response.statusText);
+                  }
+                }
+              }
+            }
+            
+            if (added) {
+              console.log(`✓ External media channel successfully integrated into call bridge`);
+            }
+            
+            break; // Only process first matching channel
+          }
+        }
+      }
+    });
+    
+    // Monitor ChannelDialState to detect when Dial() connects
+    ariClient.on('ChannelDialState', async (event, channel) => {
+      const channelInfo = channelsToRecord.get(channel.id);
+      if (channelInfo && event.dialstatus === 'ANSWER') {
+        console.log(`Dial answered for channel ${channel.id}, checking for bridge...`);
+        // Wait a moment for bridge to be created
+        await new Promise(resolve => setTimeout(resolve, 500));
+        await addRecordingChannelToBridge(channelInfo, channel.id);
+      }
+    });
+    
+    // Also monitor ChannelStateChange to catch when Dial connects
+    ariClient.on('ChannelStateChange', async (event, channel) => {
+      const channelInfo = channelsToRecord.get(channel.id);
+      if (channelInfo && channel.state === 'Up') {
+        console.log(`Channel ${channel.id} state changed to Up, checking for bridge...`);
+        // Channel is up, check if it's in a bridge
+        await addRecordingChannelToBridge(channelInfo, channel.id);
+      }
+    });
+    
+    // Periodic check for bridges (in case events are missed)
+    setInterval(async () => {
+      for (const [channelId, channelInfo] of channelsToRecord.entries()) {
+        const session = activeSessions.get(channelInfo.sessionId);
+        // Only check if not already in a bridge
+        if (session && !session.bridgeId) {
+          await addRecordingChannelToBridge(channelInfo, channelId);
+        }
+      }
+    }, 2000); // Check every 2 seconds
+    
+    // Helper function to add recording channel to bridge
+    async function addRecordingChannelToBridge(channelInfo, channelId) {
+      try {
+        const bridges = await ariClient.bridges.list();
+        for (const bridge of bridges) {
+          if (bridge.channels && bridge.channels.includes(channelId)) {
+            // Channel is in a bridge, add recording channel if not already added
+            if (!bridge.channels.includes(channelInfo.externalMediaId)) {
+              console.log(`Found bridge ${bridge.id} with channel ${channelId}, adding recording channel ${channelInfo.externalMediaId}`);
+              try {
+                // Verify external media channel exists
+                const extChannel = await ariClient.channels.get({ channelId: channelInfo.externalMediaId });
+                console.log(`External media channel ${channelInfo.externalMediaId} exists, state: ${extChannel.state}`);
+                
+                // Get bridge object
+                const bridgeObj = ariClient.Bridge();
+                bridgeObj.id = bridge.id;
+                
+                // Add external media recording channel to the bridge
+                await bridgeObj.addChannel({ channel: channelInfo.externalMediaId });
+                console.log(`✓ Added recording channel ${channelInfo.externalMediaId} to bridge ${bridge.id}`);
+                
+                // Verify it was added
+                const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
+                console.log(`Bridge ${bridge.id} now has channels:`, bridgeInfo.channels || []);
+                
+                // Store bridge ID in session
+                const session = activeSessions.get(channelInfo.sessionId);
+                if (session) {
+                  session.bridgeId = bridge.id;
+                  console.log(`Session ${channelInfo.sessionId} is now recording from bridge ${bridge.id}`);
+                }
+                
+                // Monitor bridge destruction
+                bridgeObj.on('BridgeDestroyed', async () => {
+                  console.log(`Bridge ${bridge.id} destroyed, cleaning up session ${channelInfo.sessionId}`);
+                  await cleanupSession(channelInfo.sessionId);
+                  channelsToRecord.delete(channelId);
+                });
+                
+              } catch (addErr) {
+                console.error(`Error adding recording channel:`, addErr.message || addErr);
+              }
+            } else {
+              console.log(`Recording channel ${channelInfo.externalMediaId} already in bridge ${bridge.id}`);
+            }
+            break;
+          }
+        }
+      } catch (err) {
+        console.error(`Error checking bridges:`, err.message || err);
+      }
+    }
+    
+    ariClient.on('StasisEnd', async (event, channel) => {
+      console.log(`Channel ${channel.id} left Stasis application`);
+      
+      // Cleanup recording session if channel was being recorded
+      const channelInfo = channelsToRecord.get(channel.id);
+      if (channelInfo) {
+        await cleanupSession(channelInfo.sessionId);
+        channelsToRecord.delete(channel.id);
+      } else {
+        // Fallback: find session by channel ID
+        for (const [sessionId, session] of activeSessions.entries()) {
+          if (session.channelId === channel.id) {
+            await cleanupSession(sessionId);
+            break;
+          }
+        }
+      }
+    });
+    
+    // Start Stasis application
+    ariClient.start('rtp-recorder');
+    console.log('Stasis application "rtp-recorder" started');
+    
+  } catch (error) {
+    console.error('Error connecting to ARI:', error.message || error);
+    console.log('Retrying ARI connection in 10 seconds...');
+    setTimeout(connectARI, 10000); // Retry after 10 seconds
+  }
+}
+
+// Handle voicemail when dial fails or no answer
+async function handleVoicemail(channel, extension, bridge, sessionId) {
+  try {
+    console.log(`Handling voicemail for extension ${extension}`);
+    
+    // Play "nobody available" message
+    try {
+      await channel.play({ media: 'sound:vm-nobodyavail' });
+    } catch (playError) {
+      console.error(`Error playing vm-nobodyavail:`, playError);
+      // Try alternative playback method
+      try {
+        await channel.play({ media: 'vm-nobodyavail' });
+      } catch (e) {
+        console.error(`Alternative playback also failed:`, e);
+      }
+    }
+    
+    // Send to voicemail using ARI externalMedia or continue in dialplan
+    try {
+      const voicemailBox = `${extension}@main`;
+      console.log(`Sending to voicemail: ${voicemailBox}`);
+      
+      // Use ARI to execute VoiceMail application via external script
+      // We'll use continueInDialplan to jump to voicemail context
+      try {
+        await channel.continueInDialplan({
+          context: 'internal',
+          extension: extension,
+          priority: 4  // VoiceMail priority
+        });
+      } catch (continueError) {
+        console.error(`Error continuing in dialplan:`, continueError);
+        // Fallback: Use external script or direct voicemail
+        // For now, just hangup after playing message
+        await channel.hangup();
+        await cleanupSession(sessionId);
+      }
+    } catch (vmError) {
+      console.error(`Error sending to voicemail:`, vmError);
+      // If voicemail fails, just hangup
+      await channel.hangup();
+      await cleanupSession(sessionId);
+    }
+  } catch (error) {
+    console.error(`Error in handleVoicemail:`, error);
+    await cleanupSession(sessionId);
+  }
+}
+
+// Cleanup session
+async function cleanupSession(sessionId) {
+  const session = activeSessions.get(sessionId);
+  if (!session) return;
+  
+  try {
+    // Clean up bridge if it exists
+    if (session.bridgeId && ariClient) {
+      try {
+        const bridge = ariClient.Bridge();
+        bridge.id = session.bridgeId;
+        await bridge.destroy();
+        console.log(`Destroyed bridge ${session.bridgeId}`);
+      } catch (err) {
+        // Bridge might already be destroyed, ignore
+        console.log(`Bridge ${session.bridgeId} cleanup: ${err.message || 'already destroyed'}`);
+      }
+    }
+    
+    // End write stream if it exists
+    if (session.writeStream) {
+      try {
+        // Check if stream is already ended
+        if (!session.writeStream.destroyed && !session.writeStream.writableEnded) {
+          session.writeStream.end();
+        }
+      } catch (err) {
+        console.error(`Error ending write stream:`, err.message || err);
+      }
+    }
+    
+    // Wait for file to be written (with timeout)
+    await new Promise((resolve) => {
+      if (session.fileStream && !session.fileStream.destroyed) {
+        const timeout = setTimeout(resolve, 2000);
+        const cleanup = () => {
+          clearTimeout(timeout);
+          resolve();
+        };
+        session.fileStream.once('close', cleanup);
+        session.fileStream.once('error', cleanup);
+        session.fileStream.once('finish', cleanup);
+      } else {
+        setTimeout(resolve, 500);
+      }
+    });
+    
+    const duration = session.startTime ? ((new Date() - session.startTime) / 1000) : 0;
+    console.log(`Recording ${sessionId} completed. Duration: ${duration.toFixed(2)}s. Packets: ${session.packetCount || 0}. File: ${session.wavPath}`);
+    
+    // Convert to MP3 if needed (for now, keep as WAV)
+    if (session.wavPath && fs.existsSync(session.wavPath)) {
+      try {
+        const mp3Path = session.wavPath.replace('.wav', '.mp3');
+        await convertToMP3(session.wavPath, mp3Path);
+      } catch (convertError) {
+        console.error(`Error converting to MP3:`, convertError.message || convertError);
+      }
+    } else if (session.wavPath) {
+      console.log(`Warning: Recording file ${session.wavPath} does not exist`);
+    }
+    
+    activeSessions.delete(sessionId);
+  } catch (error) {
+    console.error(`Error cleaning up session ${sessionId}:`, error.message || error);
+    // Ensure session is removed even on error
+    try {
+      activeSessions.delete(sessionId);
+    } catch (e) {
+      // Ignore
+    }
+  }
+}
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    activeSessions: activeSessions.size,
+    rtpPort: RTP_PORT 
+  });
+});
+
+// Get recordings list
+app.get('/recordings', async (req, res) => {
+  try {
+    const files = await fs.readdir(RECORDINGS_DIR);
+    const recordings = await Promise.all(
+      files
+        .filter(f => f.endsWith('.wav') || f.endsWith('.mp3'))
+        .map(async (file) => {
+          const filePath = path.join(RECORDINGS_DIR, file);
+          const stats = await fs.stat(filePath);
+          return {
+            filename: file,
+            size: stats.size,
+            created: stats.birthtime,
+            path: filePath
+          };
+        })
+    );
+    res.json(recordings);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Download recording
+app.get('/recordings/:filename', (req, res) => {
+  const filename = req.params.filename;
+  const filePath = path.join(RECORDINGS_DIR, filename);
+  
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'Recording not found' });
+  }
+  
+  res.download(filePath, filename);
+});
+
+// Start HTTP server
+const HTTP_PORT = process.env.HTTP_PORT || 3000;
+app.listen(HTTP_PORT, '0.0.0.0', () => {
+  console.log(`HTTP Server listening on port ${HTTP_PORT}`);
+});
+
+// Connect to ARI
+connectARI();
+
+// Process error handlers to prevent crashes
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error.message || error);
+  console.error('Stack:', error.stack);
+  // Don't exit - log and continue
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise);
+  console.error('Reason:', reason);
+  // Don't exit - log and continue
+});
+
+// Handle writeStream errors
+process.on('error', (error) => {
+  console.error('Process error:', error.message || error);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('Shutting down...');
+  rtpServer.close();
+  if (ariClient) {
+    try {
+      ariClient.stop();
+    } catch (e) {
+      console.error('Error stopping ARI client:', e);
+    }
+  }
+  // Cleanup all sessions
+  for (const sessionId of activeSessions.keys()) {
+    try {
+      cleanupSession(sessionId);
+    } catch (e) {
+      console.error(`Error cleaning up session ${sessionId}:`, e);
+    }
+  }
+  setTimeout(() => process.exit(0), 2000);
+});
+
+process.on('SIGINT', () => {
+  console.log('Received SIGINT, shutting down gracefully...');
+  rtpServer.close();
+  if (ariClient) {
+    try {
+      ariClient.stop();
+    } catch (e) {
+      console.error('Error stopping ARI client:', e);
+    }
+  }
+  // Cleanup all sessions
+  for (const sessionId of activeSessions.keys()) {
+    try {
+      cleanupSession(sessionId);
+    } catch (e) {
+      console.error(`Error cleaning up session ${sessionId}:`, e);
+    }
+  }
+  setTimeout(() => process.exit(0), 2000);
+});
+
