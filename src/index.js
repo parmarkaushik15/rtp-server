@@ -201,6 +201,12 @@ rtpServer.on('message', (msg, rinfo) => {
       return;
     }
     
+    // Check if session is being cleaned up or already closed
+    if (session && session.closing) {
+      // Session is being cleaned up - ignore late-arriving packets
+      return;
+    }
+    
     if (session && session.writeStream) {
       // Extract payload (skip 12 byte header + CSRC if present)
       const payloadOffset = 12 + (csrcCount * 4);
@@ -645,7 +651,8 @@ async function connectARI() {
           packetCount: 0,
           ssrc: null,
           extension: extension,
-          bridgeId: bridge.id
+          bridgeId: bridge.id,
+          closing: false // Flag to mark session as being cleaned up
         });
         
         console.log(`Created RTP session ${sessionId} for extension ${extension} on ${rtpAddress}:${rtpPort}`);
@@ -675,6 +682,30 @@ async function connectARI() {
           // Continue channel in dialplan - Dial() will create its bridge
           // When Dial() creates bridge, we'll add external media channel to it (see BridgeCreated handler)
           await channel.continueInDialplan();
+          
+          // Handle channel hangup - cleanup session when call ends
+          channel.on('ChannelHangupRequest', async () => {
+            console.log(`[7001/7002] Channel ${channel.id} hangup requested - cleaning up session ${sessionId}`);
+            const session = activeSessions.get(sessionId);
+            if (session) {
+              session.closing = true; // Mark as closing to ignore late packets
+            }
+            await cleanupSession(sessionId);
+            channelsToRecord.delete(channel.id);
+          });
+          
+          // Handle external media channel hangup
+          extChannel.on('ChannelHangupRequest', async () => {
+            console.log(`[7001/7002] External media channel ${extChannel.id} hangup requested`);
+            const channelInfo = channelsToRecord.get(channel.id);
+            if (channelInfo) {
+              const session = activeSessions.get(channelInfo.sessionId);
+              if (session) {
+                session.closing = true; // Mark as closing to ignore late packets
+              }
+              await cleanupSession(channelInfo.sessionId);
+            }
+          });
         } catch (externalMediaError) {
           console.error(`Error creating external media channel:`, externalMediaError);
           const errorMsg = externalMediaError.message || JSON.stringify(externalMediaError);
@@ -728,19 +759,6 @@ async function connectARI() {
           }
           return;
         }
-        
-        // Store channel info for bridge monitoring
-        channelsToRecord.set(channel.id, {
-          sessionId: sessionId,
-          externalMediaId: extChannel.id,
-          extension: extension
-        });
-        
-        console.log(`ExternalMedia channel ${extChannel.id} created and mapped to bridge ${bridge.id}`);
-        
-        // Continue channel in dialplan - Dial() will create its bridge
-        // When Dial() creates bridge, we'll add external media channel to it (see BridgeCreated handler)
-        await channel.continueInDialplan();
         
       } catch (error) {
         console.error('Error in StasisStart:', error);
@@ -885,15 +903,36 @@ async function connectARI() {
     ariClient.on('StasisEnd', async (event, channel) => {
       console.log(`Channel ${channel.id} left Stasis application`);
       
-      // CRITICAL: Do NOT cleanup session here! Channels leave Stasis when continueInDialplan() is called,
-      // but RTP packets continue to arrive during the call. We'll cleanup only on actual channel hangup.
-      const channelInfo = channelsToRecord.get(channel.id);
-      if (channelInfo) {
-        console.log(`  → Channel ${channel.id} left Stasis, but keeping session ${channelInfo.sessionId} alive for RTP recording`);
-        console.log(`  → Session will be cleaned up when channel hangs up (ChannelHangupRequest event)`);
+      // Handle external media channel cleanup (matching reference implementation)
+      if (channel.name && channel.name.startsWith('UnicastRTP')) {
+        extMap.delete(channel.id);
+        console.log(`ExternalMedia channel ${channel.id} removed from map`);
+      } else {
+        // Handle SIP channel cleanup (matching reference implementation)
+        const bridge = sipMap.get(channel.id);
+        if (bridge) {
+          try {
+            await bridge.destroy();
+            console.log(`Bridge ${bridge.id} destroyed`);
+          } catch (e) {
+            console.error(`Error destroying bridge ${bridge.id}: ${e}`);
+          }
+          sipMap.delete(channel.id);
+        }
+        
+        // Cleanup session when SIP channel ends (matching reference implementation)
+        const channelInfo = channelsToRecord.get(channel.id);
+        if (channelInfo) {
+          const session = activeSessions.get(channelInfo.sessionId);
+          if (session) {
+            session.closing = true; // Mark as closing to ignore late-arriving packets
+            console.log(`[7001/7002] Channel ${channel.id} ended - marking session ${channelInfo.sessionId} as closing`);
+          }
+          await cleanupSession(channelInfo.sessionId);
+          channelsToRecord.delete(channel.id);
+        }
       }
-      // Don't delete from channelsToRecord - we need it for hangup detection
-      // Sessions stay alive until ChannelHangupRequest fires
+      console.log(`Channel ended: ${channel.id}`);
     });
     
     // Start Stasis application
@@ -961,6 +1000,10 @@ async function handleVoicemail(channel, extension, bridge, sessionId) {
 async function cleanupSession(sessionId) {
   const session = activeSessions.get(sessionId);
   if (!session) return;
+  
+  // Mark session as closing IMMEDIATELY to prevent processing late-arriving packets
+  session.closing = true;
+  console.log(`[7001/7002] Session ${sessionId} marked as closing - ignoring late packets`);
   
   try {
     // Bridge cleanup is handled in StasisEnd handler, no need to destroy here
