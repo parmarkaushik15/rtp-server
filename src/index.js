@@ -156,35 +156,62 @@ rtpServer.on('message', (msg, rinfo) => {
       const session = sessions[0][1];
       if (!session.ssrc) {
         session.ssrc = ssrc;
+        session.ssrcs = [ssrc];
         console.log(`✓✓✓ Matched RTP packet to only active session ${sessionId}, assigned SSRC ${ssrc} (From=${rinfo.address}:${rinfo.port})`);
-      } else if (session.ssrc === ssrc) {
-        // SSRC already matches
-        console.log(`✓ Matched RTP packet by SSRC ${ssrc} to session ${sessionId}`);
-      } else {
-        // Different SSRC but only one session - still use it (might be multiple streams)
+      } else if (session.ssrc === ssrc || session.ssrcs.includes(ssrc)) {
+        // SSRC already matches - this is known
+      } else if (!session.ssrcs.includes(ssrc)) {
+        // Different SSRC - likely the reverse direction (bidirectional audio)
+        session.ssrcs.push(ssrc);
+        console.log(`✓ Matched RTP packet to session ${sessionId}, added second SSRC ${ssrc} (bidirectional audio, primary=${session.ssrc})`);
       }
     } else {
-      // Multiple sessions - try to match by port or use first session without SSRC
+      // Multiple sessions - try to match by SSRC first, then by port
       for (const [sid, sess] of sessions) {
-        // Match by port if it matches our RTP_PORT or session's expected port
-        if (rinfo.port === sess.rtpPort || rinfo.port === RTP_PORT || !sess.ssrc) {
+        // If this session already knows this SSRC, use it
+        if (sess.ssrc === ssrc || (sess.ssrcs && sess.ssrcs.includes(ssrc))) {
           sessionId = sid;
-          const session = sess;
-          if (!session.ssrc) {
-            session.ssrc = ssrc;
-            console.log(`✓ Matched RTP packet to session ${sessionId} (no SSRC yet), assigned SSRC ${ssrc}`);
-          }
           break;
         }
       }
       
-      // If still no match and we have sessions, use the first one without SSRC
+      // If still no match, try matching by port or assign to session without SSRC
+      if (!sessionId) {
+        for (const [sid, sess] of sessions) {
+          // Match by port if it matches our RTP_PORT or session's expected port
+          if (rinfo.port === sess.rtpPort || rinfo.port === RTP_PORT || !sess.ssrc) {
+            sessionId = sid;
+            const session = sess;
+            if (!session.ssrc) {
+              session.ssrc = ssrc;
+              session.ssrcs = [ssrc];
+              console.log(`✓ Matched RTP packet to session ${sessionId} (no SSRC yet), assigned SSRC ${ssrc}`);
+            } else if (!session.ssrcs || !session.ssrcs.includes(ssrc)) {
+              // Different SSRC - likely the reverse direction
+              if (!session.ssrcs) session.ssrcs = [session.ssrc];
+              session.ssrcs.push(ssrc);
+              console.log(`✓ Matched RTP packet to session ${sessionId}, added second SSRC ${ssrc} (bidirectional, primary=${session.ssrc})`);
+            }
+            break;
+          }
+        }
+      }
+      
+      // If still no match and we have sessions, use the first one without SSRC or assign as second SSRC
       if (!sessionId) {
         for (const [sid, sess] of sessions) {
           if (!sess.ssrc) {
             sessionId = sid;
             sess.ssrc = ssrc;
+            sess.ssrcs = [ssrc];
             console.log(`✓✓✓ Using first session without SSRC ${sessionId}, assigned SSRC ${ssrc}`);
+            break;
+          } else if (!sess.ssrcs || sess.ssrcs.length === 1) {
+            // Session has only one SSRC, this might be the second direction
+            sessionId = sid;
+            if (!sess.ssrcs) sess.ssrcs = [sess.ssrc];
+            sess.ssrcs.push(ssrc);
+            console.log(`✓ Matched unmatched packet SSRC ${ssrc} to session ${sessionId} as second SSRC (primary=${sess.ssrc})`);
             break;
           }
         }
@@ -276,7 +303,22 @@ rtpServer.on('message', (msg, rinfo) => {
         const targetSessions = Array.from(activeSessions.entries()).filter(([_, s]) => s.extension === '7001' || s.extension === '7002');
         console.log(`[7001/7002] ⚠ Unmatched RTP packet: SSRC=${ssrc}, PT=${payloadType}, From=${rinfo.address}:${rinfo.port}`);
         console.log(`  → Active 7001/7002 sessions:`, targetSessions.map(([id, s]) => `${id} (${s.extension})`));
-        console.log(`  → Session SSRCs:`, targetSessions.map(([_, s]) => s.ssrc || 'none'));
+        console.log(`  → Session SSRCs:`, targetSessions.map(([_, s]) => {
+          if (s.ssrcs && s.ssrcs.length > 0) {
+            return s.ssrcs.join(',');
+          }
+          return s.ssrc || 'none';
+        }));
+        
+        // Try to match to a session that has only one SSRC (likely bidirectional audio)
+        for (const [sid, sess] of targetSessions) {
+          if (sess.ssrcs && sess.ssrcs.length === 1 && !sess.ssrcs.includes(ssrc)) {
+            sess.ssrcs.push(ssrc);
+            console.log(`  → ✓ Auto-matched SSRC ${ssrc} to session ${sid} as second SSRC (bidirectional audio)`);
+            sessionId = sid;
+            break;
+          }
+        }
       }
     }
   }
@@ -673,7 +715,8 @@ async function connectARI() {
           wavPath: wavPath,
           startTime: new Date(),
           packetCount: 0,
-          ssrc: null,
+          ssrc: null, // Primary SSRC (first direction)
+          ssrcs: [], // Array to track multiple SSRCs (bidirectional audio)
           extension: extension,
           bridgeId: null, // Will be set when Dial() creates bridge
           closing: false // Flag to mark session as being cleaned up
@@ -853,6 +896,17 @@ async function connectARI() {
                 // Verify it was added
                 const verifyBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
                 console.log(`  → Bridge ${bridge.id} now has channels:`, verifyBridge.channels || []);
+                
+                // Monitor this bridge for destruction - when it's destroyed, cleanup session
+                dialBridge.on('BridgeDestroyed', async () => {
+                  console.log(`[7001/7002] Dial() bridge ${bridge.id} destroyed - cleaning up session ${channelInfo.sessionId}`);
+                  const sess = activeSessions.get(channelInfo.sessionId);
+                  if (sess && !sess.closing) {
+                    sess.closing = true;
+                    await cleanupSession(channelInfo.sessionId);
+                    channelsToRecord.delete(channelId);
+                  }
+                });
               }
               
             } catch (addErr) {
@@ -1038,9 +1092,71 @@ async function connectARI() {
     // Monitor channel state changes to detect when call actually ends
     ariClient.on('ChannelStateChange', async (event, channel) => {
       const channelInfo = channelsToRecord.get(channel.id);
-      if (channelInfo && channel.state === 'Down') {
+      if (channelInfo && (channel.state === 'Down' || channel.state === 'Down')) {
         // Channel is actually down now - cleanup session
-        console.log(`[7001/7002] Channel ${channel.id} state changed to Down - cleaning up session ${channelInfo.sessionId}`);
+        console.log(`[7001/7002] Channel ${channel.id} state changed to ${channel.state} - cleaning up session ${channelInfo.sessionId}`);
+        const session = activeSessions.get(channelInfo.sessionId);
+        if (session) {
+          session.closing = true;
+        }
+        await cleanupSession(channelInfo.sessionId);
+        channelsToRecord.delete(channel.id);
+      }
+    });
+    
+    // Monitor bridge destruction - when bridge is destroyed, cleanup all sessions using it
+    ariClient.on('BridgeDestroyed', async (event, bridge) => {
+      console.log(`[7001/7002] Bridge ${bridge.id} destroyed - checking for sessions to cleanup`);
+      
+      // Find all sessions using this bridge
+      for (const [channelId, channelInfo] of channelsToRecord.entries()) {
+        const session = activeSessions.get(channelInfo.sessionId);
+        if (session && session.bridgeId === bridge.id) {
+          console.log(`[7001/7002] Bridge ${bridge.id} destroyed, cleaning up session ${channelInfo.sessionId} for channel ${channelId}`);
+          if (session) {
+            session.closing = true;
+          }
+          await cleanupSession(channelInfo.sessionId);
+          channelsToRecord.delete(channelId);
+        }
+      }
+    });
+    
+    // Periodic check to verify channels are still active (cleanup if not)
+    setInterval(async () => {
+      for (const [channelId, channelInfo] of channelsToRecord.entries()) {
+        try {
+          // Try to get channel - if it fails or channel is down, cleanup session
+          const channel = await ariClient.channels.get({ channelId: channelId });
+          if (!channel || channel.state === 'Down' || channel.state === 'RSRVD') {
+            console.log(`[7001/7002] Channel ${channelId} is down or invalid (state: ${channel?.state || 'NOT_FOUND'}) - cleaning up session ${channelInfo.sessionId}`);
+            const session = activeSessions.get(channelInfo.sessionId);
+            if (session && !session.closing) {
+              session.closing = true;
+              await cleanupSession(channelInfo.sessionId);
+              channelsToRecord.delete(channelId);
+            }
+          }
+        } catch (err) {
+          // Channel doesn't exist anymore - cleanup session
+          if (err.message && (err.message.includes('not found') || err.message.includes('404'))) {
+            console.log(`[7001/7002] Channel ${channelId} not found - cleaning up session ${channelInfo.sessionId}`);
+            const session = activeSessions.get(channelInfo.sessionId);
+            if (session && !session.closing) {
+              session.closing = true;
+              await cleanupSession(channelInfo.sessionId);
+              channelsToRecord.delete(channelId);
+            }
+          }
+        }
+      }
+    }, 5000); // Check every 5 seconds
+    
+    // Also monitor for channel hangup events (more reliable than state change)
+    ariClient.on('ChannelDestroyed', async (event, channel) => {
+      const channelInfo = channelsToRecord.get(channel.id);
+      if (channelInfo) {
+        console.log(`[7001/7002] Channel ${channel.id} destroyed - cleaning up session ${channelInfo.sessionId}`);
         const session = activeSessions.get(channelInfo.sessionId);
         if (session) {
           session.closing = true;
