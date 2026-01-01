@@ -13,6 +13,7 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 const wav = require('wav'); // WAV file writer (matching reference implementation)
 const http = require('http');
+const RTPServer = require('./rtpServer'); // Reference RTPServer class
 
 const app = express();
 app.use(express.json());
@@ -464,41 +465,10 @@ rtpServer.bind(RTP_PORT, '0.0.0.0', () => {
   console.log(`  You should see [UDP] Packet logs if connectivity is OK\n`);
 });
 
-// Convert a single μ-law sample to linear PCM (16-bit) - EXACTLY matching reference implementation
-// Reference: rtpServer.js line 23-29
-function muLawToLinear(mu) {
-  mu = ~mu & 0xFF;                           // Bitwise NOT and mask to get 8-bit μ-law value
-  const sign = (mu & 0x80) ? -1 : 1;      // Extract sign bit (0x80): -1 for negative, 1 for positive
-  const exponent = (mu >> 4) & 0x07;      // Extract 3-bit exponent (bits 4-6)
-  const mantissa = mu & 0x0F;             // Extract 4-bit mantissa (bits 0-3)
-  const sample = sign * (((mantissa << 1) + 33) << exponent) - 33; // Convert to linear PCM using μ-law formula
-  return sample;                           // Return the 16-bit PCM sample
-}
-
-// Test conversion: 0x7F (silence) should convert to a small value near 0
-// 0xFF (max positive) should convert to a positive value
-// 0x00 (max negative) should convert to a negative value
-if (typeof global !== 'undefined' && !global.muLawTestDone) {
-  global.muLawTestDone = true;
-  const testSilence = muLawToLinear(0x7F);  // Silence
-  const testMaxPos = muLawToLinear(0xFF);   // Max positive
-  const testMaxNeg = muLawToLinear(0x00);   // Max negative
-  console.log(`[μ-law Test] Silence (0x7F) -> ${testSilence}, MaxPos (0xFF) -> ${testMaxPos}, MaxNeg (0x00) -> ${testMaxNeg}`);
-  if (Math.abs(testSilence) > 100) {
-    console.warn(`[μ-law Test] ⚠ WARNING: Silence conversion seems wrong (expected ~0, got ${testSilence})`);
-  }
-}
-
-// Convert PCMU (μ-law) to PCM - matching reference implementation
+// Use RTPServer static methods for conversion (using reference implementation)
 function convertPCMUtoPCM(pcmuData) {
-  const numSamples = pcmuData.length;      // Number of μ-law samples in the buffer
-  const pcmData = Buffer.alloc(numSamples * 2); // Allocate buffer for PCM (2 bytes per sample)
-  for (let i = 0; i < numSamples; i++) {   // Loop through each μ-law sample
-    const mu = pcmuData[i];                // Get the current μ-law sample
-    const linear = muLawToLinear(mu);       // Convert it to linear PCM
-    pcmData.writeInt16LE(linear, i * 2);   // Write PCM sample as 16-bit little-endian
-  }
-  return pcmData;                          // Return the PCM buffer
+  // Use the reference RTPServer conversion method
+  return RTPServer.convertMuLawToPCM(pcmuData);
 }
 
 // G.711 A-law to PCM conversion table
@@ -611,17 +581,10 @@ function logSessionStatus() {
 // Log session status every 5 seconds (more frequent for debugging)
 setInterval(logSessionStatus, 5000);
 
-// Create WAV file writer (matching reference implementation)
+// Create WAV file writer using RTPServer static method (matching reference implementation)
 function createWAVWriter(filePath, sampleRate = 8000, channels = 1, bitDepth = 16) {
-  const fileStream = fs.createWriteStream(filePath);
-  const wavWriter = new wav.Writer({
-    channels: channels,
-    sampleRate: sampleRate,
-    bitDepth: bitDepth
-  });
-  wavWriter.pipe(fileStream);
-  
-  return { writeStream: wavWriter, fileStream: fileStream };
+  // Use the reference RTPServer static method
+  return RTPServer.createWAVWriter(filePath, sampleRate, channels, bitDepth);
 }
 
 // Convert WAV to MP3 using ffmpeg (if available) or keep as WAV
