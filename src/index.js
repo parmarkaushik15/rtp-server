@@ -624,9 +624,16 @@ async function connectARI() {
           mapping = extMap.get(channel.id); 
         }
         if (mapping) {
-          console.log(`  → Found mapping for bridge ${mapping.bridgeId}, adding to bridge...`);
-          await addExtToBridge(ariClient, channel, mapping.bridgeId);
-          console.log(`  ✓ ExternalMedia channel ${channel.id} successfully added to bridge ${mapping.bridgeId}`);
+          // Check if bridgeId is set (Dial()'s bridge should be created by now)
+          if (mapping.bridgeId) {
+            console.log(`  → Found mapping for bridge ${mapping.bridgeId}, adding to bridge...`);
+            await addExtToBridge(ariClient, channel, mapping.bridgeId);
+            console.log(`  ✓ ExternalMedia channel ${channel.id} successfully added to bridge ${mapping.bridgeId}`);
+          } else {
+            console.log(`  → Mapping found but bridgeId not set yet (Dial() bridge not created yet)`);
+            console.log(`  → Will wait for BridgeCreated event to add external media to Dial()'s bridge`);
+            // BridgeCreated handler will add it when Dial() creates the bridge
+          }
         } else {
           console.warn(`  ⚠ ExternalMedia channel ${channel.id} not found in tracking map`);
           console.warn(`  Available tracked channels:`, Array.from(extMap.keys()));
@@ -643,18 +650,11 @@ async function connectARI() {
       
       console.log(`SIP channel started: ${channel.id}`);
       try {
-        // Create bridge per call (matching reference implementation)
-        // Using 'mixing,proxy_media' like reference for better media handling
-        const bridge = await ariClient.bridges.create({ type: 'mixing,proxy_media' });
-        await bridge.addChannel({ channel: channel.id });
-        sipMap.set(channel.id, bridge);
-        console.log(`Created bridge ${bridge.id} and added SIP channel ${channel.id}`);
-        
-        // Answer the channel
+        // Answer the channel first
         await channel.answer();
         console.log(`Channel ${channel.id} answered`);
         
-        // Set up recording session
+        // Set up recording session BEFORE creating external media
         const sessionId = uuidv4();
         const rtpPort = RTP_PORT;
         const rtpAddress = getRTPServerAddress();
@@ -662,7 +662,7 @@ async function connectARI() {
         const wavPath = path.join(RECORDINGS_DIR, `${sessionId}.wav`);
         const { writeStream, fileStream } = createWAVWriter(wavPath, 8000, 1, 16);
         
-        // Store session
+        // Store session (no bridgeId yet - will be set when Dial() creates bridge)
         activeSessions.set(sessionId, {
           channelId: channel.id,
           rtpAddress: rtpAddress,
@@ -675,13 +675,14 @@ async function connectARI() {
           packetCount: 0,
           ssrc: null,
           extension: extension,
-          bridgeId: bridge.id,
+          bridgeId: null, // Will be set when Dial() creates bridge
           closing: false // Flag to mark session as being cleaned up
         });
         
         console.log(`Created RTP session ${sessionId} for extension ${extension} on ${rtpAddress}:${rtpPort}`);
         
         // Create external media channel (matching reference implementation)
+        // NOTE: We DON'T add it to a bridge yet - we'll add it to Dial()'s bridge when it's created
         try {
           const extParams = {
             app: 'rtp-recorder',
@@ -693,8 +694,9 @@ async function connectARI() {
             direction: 'both'
           };
           const extChannel = await ariClient.channels.externalMedia(extParams);
-          extMap.set(extChannel.id, { bridgeId: bridge.id, sessionId: sessionId });
-          console.log(`ExternalMedia channel ${extChannel.id} created and mapped to bridge ${bridge.id}`);
+          // Store mapping but WITHOUT bridgeId - will be set when Dial() creates bridge
+          extMap.set(extChannel.id, { bridgeId: null, sessionId: sessionId });
+          console.log(`ExternalMedia channel ${extChannel.id} created (will be added to Dial() bridge when created)`);
           
           // Store channel info for bridge monitoring
           channelsToRecord.set(channel.id, {
@@ -704,7 +706,7 @@ async function connectARI() {
           });
           
           // Continue channel in dialplan - Dial() will create its bridge
-          // When Dial() creates bridge, we'll add external media channel to it (see BridgeCreated handler)
+          // BridgeCreated handler will add external media channel to Dial()'s bridge
           await channel.continueInDialplan();
           
           // Handle channel hangup - cleanup session when call ends
@@ -810,26 +812,51 @@ async function connectARI() {
             console.log(`\n✓✓✓ Found channel ${channelId} in bridge ${bridge.id} ✓✓✓`);
             
             const session = activeSessions.get(channelInfo.sessionId);
+            if (!session) {
+              console.error(`  ⚠ Session ${channelInfo.sessionId} not found!`);
+              continue;
+            }
             
-            // If Dial() created a new bridge, add external media channel to it
-            if (session && session.bridgeId && session.bridgeId !== bridge.id) {
-              console.log(`  Dial() created bridge ${bridge.id}, adding external media channel to it`);
-              
-              try {
-                // Add external media to Dial's bridge (will auto-remove from our recording bridge)
-                const dialBridgeObj = ariClient.Bridge();
-                dialBridgeObj.id = bridge.id;
-                await dialBridgeObj.addChannel({ channel: channelInfo.externalMediaId });
-                console.log(`✓✓✓ Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id} ✓✓✓`);
-                
-                // Update session
-                session.bridgeId = bridge.id;
-              } catch (addErr) {
-                console.error(`Error adding external media to Dial() bridge:`, addErr.message || addErr);
+            // This is Dial()'s bridge - add external media channel to it
+            console.log(`  → This is Dial()'s bridge - adding external media channel ${channelInfo.externalMediaId} to it`);
+            
+            // Update session with Dial()'s bridge ID
+            session.bridgeId = bridge.id;
+            
+            // Update extMap with Dial()'s bridge ID
+            const extMapping = extMap.get(channelInfo.externalMediaId);
+            if (extMapping) {
+              extMapping.bridgeId = bridge.id;
+            }
+            
+            try {
+              // Get bridge object and add external media channel to Dial()'s bridge
+              const dialBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
+              if (!dialBridge) {
+                console.error(`  ⚠ Bridge ${bridge.id} not found!`);
+                continue;
               }
-            } else {
-              // Same bridge or no bridge yet - external media should already be in bridge
-              console.log(`  External media channel should already be in bridge ${bridge.id}`);
+              
+              await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
+              console.log(`✓✓✓✓✓ CRITICAL: Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id} ✓✓✓✓✓`);
+              console.log(`  → RTP packets should now flow to our RTP server!`);
+              
+              // Verify it was added
+              const bridgeInfo = await ariClient.bridges.get({ bridgeId: bridge.id });
+              console.log(`  → Bridge ${bridge.id} now has channels:`, bridgeInfo.channels || []);
+              
+            } catch (addErr) {
+              console.error(`  ⚠ Error adding external media to Dial() bridge:`, addErr.message || addErr);
+              // Retry adding to bridge
+              setTimeout(async () => {
+                try {
+                  const dialBridge = await ariClient.bridges.get({ bridgeId: bridge.id });
+                  await dialBridge.addChannel({ channel: channelInfo.externalMediaId });
+                  console.log(`✓ Retry successful: Added external media channel ${channelInfo.externalMediaId} to Dial() bridge ${bridge.id}`);
+                } catch (retryErr) {
+                  console.error(`  ⚠ Retry failed:`, retryErr.message || retryErr);
+                }
+              }, 1000);
             }
             
             break; // Only process first matching channel
