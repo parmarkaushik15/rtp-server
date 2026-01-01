@@ -294,13 +294,33 @@ rtpServer.on('message', (msg, rinfo) => {
           }
         }
         
+        // CRITICAL: Detect codec from RTP payload type and update session if needed
+        // PT=0 = PCMU (μ-law), PT=8 = PCMA (A-law)
+        if (payloadType === 0 && session.codec !== 'PCMU') {
+          console.warn(`[7001/7002] ⚠ CODEC MISMATCH: RTP packets are PCMU (PT=0) but session configured as ${session.codec}. Updating to PCMU.`);
+          session.codec = 'PCMU';
+        } else if (payloadType === 8 && session.codec !== 'PCMA') {
+          console.warn(`[7001/7002] ⚠ CODEC MISMATCH: RTP packets are PCMA (PT=8) but session configured as ${session.codec}. Updating to PCMA.`);
+          session.codec = 'PCMA';
+        }
+        
         // Convert PCMU (G.711 μ-law) to PCM
         if (payloadType === 0 || session.codec === 'PCMU') {
           if (payload.length > 0) {
-            // Check for silence packets (0x7F in μ-law is silence)
+            // Check for silence packets (0x7F in μ-law is silence, but 0xFF is also silence/error)
             let silenceCount = 0;
+            let ffCount = 0;
             for (let i = 0; i < payload.length; i++) {
               if (payload[i] === 0x7F) silenceCount++;
+              if (payload[i] === 0xFF) ffCount++;
+            }
+            
+            // Warn if all bytes are 0xFF (this indicates no audio or connection issue)
+            if (ffCount === payload.length && session.packetCount === 0) {
+              console.error(`[7001/7002] ⚠ CRITICAL: All payload bytes are 0xFF! This indicates:`);
+              console.error(`[7001/7002]   1. External media channel not receiving audio from bridge`);
+              console.error(`[7001/7002]   2. Codec mismatch (configured ${EXTERNAL_MEDIA_CODEC} but receiving PCMU)`);
+              console.error(`[7001/7002]   3. Bridge not properly set up`);
             }
             
             const pcmData = convertPCMUtoPCM(payload);
@@ -835,19 +855,20 @@ async function connectARI() {
           await new Promise(r => setTimeout(r, 500)); 
           mapping = extMap.get(channel.id); 
         }
-        if (mapping) {
-          // Check if bridgeId is set (Dial()'s bridge should be created by now)
-          if (mapping.bridgeId) {
-            console.log(`  → Found mapping for bridge ${mapping.bridgeId}, adding to bridge...`);
-            await addExtToBridge(ariClient, channel, mapping.bridgeId);
-            console.log(`  ✓ ExternalMedia channel ${channel.id} successfully added to bridge ${mapping.bridgeId}`);
-          } else {
-            console.log(`  → Mapping found but bridgeId not set yet (Dial() bridge not created yet)`);
-            console.log(`  → Will wait for BridgeCreated event to add external media to Dial()'s bridge`);
-            // BridgeCreated handler will add it when Dial() creates the bridge
+        if (mapping && mapping.bridgeId) {
+          console.log(`  → Found mapping for bridge ${mapping.bridgeId}, adding to bridge...`);
+          await addExtToBridge(ariClient, channel, mapping.bridgeId);
+          console.log(`  ✓✓✓ ExternalMedia channel ${channel.id} successfully added to bridge ${mapping.bridgeId} ✓✓✓`);
+          
+          // Verify it was added
+          try {
+            const verifyBridge = await ariClient.bridges.get({ bridgeId: mapping.bridgeId });
+            console.log(`  → Bridge ${mapping.bridgeId} now has channels:`, verifyBridge.channels || []);
+          } catch (e) {
+            console.error(`  ⚠ Error verifying bridge:`, e.message || e);
           }
         } else {
-          console.warn(`  ⚠ ExternalMedia channel ${channel.id} not found in tracking map`);
+          console.warn(`  ⚠ ExternalMedia channel ${channel.id} not found in tracking map or bridgeId not set`);
           console.warn(`  Available tracked channels:`, Array.from(extMap.keys()));
         }
         return;
@@ -865,6 +886,16 @@ async function connectARI() {
         // Answer the channel first
         await channel.answer();
         console.log(`Channel ${channel.id} answered`);
+        
+        // CRITICAL: Create our own bridge FIRST (matching reference implementation)
+        // This ensures we can add channels to it, unlike Dial()'s bridge which is not in Stasis
+        console.log(`[7001/7002] Creating mixing bridge for recording...`);
+        const bridge = await ariClient.bridges.create({ type: 'mixing' });
+        console.log(`[7001/7002] ✓ Created bridge ${bridge.id}`);
+        
+        // Add SIP channel to our bridge
+        await bridge.addChannel({ channel: channel.id });
+        console.log(`[7001/7002] ✓ Added SIP channel ${channel.id} to bridge ${bridge.id}`);
         
         // Set up recording session BEFORE creating external media
         const sessionId = uuidv4();
@@ -889,14 +920,14 @@ async function connectARI() {
           console.log(`[7001/7002] WAV fileStream closed for session ${sessionId}`);
         });
         
-        // Store session (no bridgeId yet - will be set when Dial() creates bridge)
-        // Map codec format to internal codec name
+        // Store session with our bridge ID
+        // Map codec format to internal codec name (will be auto-detected from RTP packets)
         const sessionCodec = EXTERNAL_MEDIA_CODEC === 'alaw' ? 'PCMA' : 'PCMU';
         activeSessions.set(sessionId, {
           channelId: channel.id,
           rtpAddress: rtpAddress,
           rtpPort: rtpPort,
-          codec: sessionCodec,  // PCMA for alaw, PCMU for ulaw
+          codec: sessionCodec,  // PCMA for alaw, PCMU for ulaw (will be auto-detected)
           writeStream: writeStream,
           fileStream: fileStream,
           wavPath: wavPath,
@@ -905,7 +936,7 @@ async function connectARI() {
           ssrc: null, // Primary SSRC (first direction)
           ssrcs: [], // Array to track multiple SSRCs (bidirectional audio)
           extension: extension,
-          bridgeId: null, // Will be set when Dial() creates bridge
+          bridgeId: bridge.id, // Our bridge ID
           closing: false // Flag to mark session as being cleaned up
         });
         
@@ -927,9 +958,9 @@ async function connectARI() {
           };
           console.log(`[7001/7002] Creating external media channel with codec: ${EXTERNAL_MEDIA_CODEC}`);
           const extChannel = await ariClient.channels.externalMedia(extParams);
-          // Store mapping but WITHOUT bridgeId - will be set when Dial() creates bridge
-          extMap.set(extChannel.id, { bridgeId: null, sessionId: sessionId });
-          console.log(`ExternalMedia channel ${extChannel.id} created (will be added to Dial() bridge when created)`);
+          // Store mapping with our bridge ID
+          extMap.set(extChannel.id, { bridgeId: bridge.id, sessionId: sessionId });
+          console.log(`ExternalMedia channel ${extChannel.id} created (will be added to bridge ${bridge.id})`);
           
           // Store channel info for bridge monitoring
           channelsToRecord.set(channel.id, {
@@ -938,8 +969,8 @@ async function connectARI() {
             extension: extension
           });
           
-          // Continue channel in dialplan - Dial() will create its bridge
-          // BridgeCreated handler will add external media channel to Dial()'s bridge
+          // External media channel will be added to bridge when it enters Stasis
+          // Continue in dialplan - Dial() will add the other party to our bridge
           await channel.continueInDialplan();
           
           // Handle channel hangup - cleanup session when call ends
