@@ -296,16 +296,29 @@ rtpServer.on('message', (msg, rinfo) => {
         
         // CRITICAL: Detect codec from RTP payload type and update session if needed
         // PT=0 = PCMU (μ-law), PT=8 = PCMA (A-law)
-        if (payloadType === 0 && session.codec !== 'PCMU') {
-          console.warn(`[7001/7002] ⚠ CODEC MISMATCH: RTP packets are PCMU (PT=0) but session configured as ${session.codec}. Updating to PCMU.`);
-          session.codec = 'PCMU';
-        } else if (payloadType === 8 && session.codec !== 'PCMA') {
-          console.warn(`[7001/7002] ⚠ CODEC MISMATCH: RTP packets are PCMA (PT=8) but session configured as ${session.codec}. Updating to PCMA.`);
-          session.codec = 'PCMA';
+        // Note: Bidirectional audio means we'll receive both codecs - handle per SSRC
+        const ssrcCodec = payloadType === 0 ? 'PCMU' : 'PCMA';
+        
+        // Track codec per SSRC (bidirectional audio can have different codecs per direction)
+        if (!session.ssrcCodecs) {
+          session.ssrcCodecs = new Map();
         }
         
+        // Only log mismatch once per SSRC
+        if (!session.ssrcCodecs.has(ssrc)) {
+          session.ssrcCodecs.set(ssrc, ssrcCodec);
+          if (session.codec !== ssrcCodec && session.packetCount < 10) {
+            // Only warn on first few packets to avoid spam
+            console.log(`[7001/7002] Detected codec ${ssrcCodec} (PT=${payloadType}) for SSRC ${ssrc} (session default: ${session.codec})`);
+          }
+        }
+        
+        // Use SSRC-specific codec for this packet
+        const packetCodec = session.ssrcCodecs.get(ssrc) || ssrcCodec;
+        
         // Convert PCMU (G.711 μ-law) to PCM
-        if (payloadType === 0 || session.codec === 'PCMU') {
+        // Use packetCodec (SSRC-specific) instead of session.codec for bidirectional audio
+        if (payloadType === 0 || packetCodec === 'PCMU') {
           if (payload.length > 0) {
             // Check for silence packets (0x7F in μ-law is silence, but 0xFF is also silence/error)
             let silenceCount = 0;
@@ -388,7 +401,7 @@ rtpServer.on('message', (msg, rinfo) => {
               console.warn(`[7001/7002] Warning: Empty payload in first packet`);
             }
           }
-        } else if (payloadType === 8 || session.codec === 'PCMA') {
+        } else if (payloadType === 8 || packetCodec === 'PCMA') {
           // PCMA (G.711 A-law)
           if (payload.length > 0) {
             // Check for silence packets (0xD5 in A-law is silence, similar to 0x7F in μ-law)
@@ -954,9 +967,11 @@ async function connectARI() {
           packetCount: 0,
           ssrc: null, // Primary SSRC (first direction)
           ssrcs: [], // Array to track multiple SSRCs (bidirectional audio)
+          ssrcCodecs: new Map(), // Track codec per SSRC (bidirectional audio can have different codecs)
           extension: extension,
           bridgeId: bridge.id, // Our bridge ID
-          closing: false // Flag to mark session as being cleaned up
+          closing: false, // Flag to mark session as being cleaned up
+          extMediaAddedLogged: false // Flag to log external media addition once
         });
         
         console.log(`Created RTP session ${sessionId} for extension ${extension} on ${rtpAddress}:${rtpPort}`);
@@ -1278,13 +1293,22 @@ async function connectARI() {
               session.bridgeId = dialBridge.id;
             }
             
+            // Get fresh bridge info to check current channels
+            let bridgeInfo;
+            try {
+              bridgeInfo = await ariClient.bridges.get({ bridgeId: dialBridge.id });
+            } catch (err) {
+              console.error(`[Periodic Check] Error getting bridge info:`, err.message || err);
+              continue;
+            }
+            
             // Check if external media is in this bridge
-            const extMediaInBridge = dialBridge.channels && dialBridge.channels.includes(channelInfo.externalMediaId);
+            const extMediaInBridge = bridgeInfo.channels && bridgeInfo.channels.includes(channelInfo.externalMediaId);
             
             if (!extMediaInBridge) {
               console.log(`[Periodic Check] ⚠ CRITICAL: External media ${channelInfo.externalMediaId} NOT in Dial() bridge ${dialBridge.id}`);
-              console.log(`[Periodic Check] Bridge ${dialBridge.id} has channels:`, dialBridge.channels || []);
-              console.log(`[Periodic Check] Adding external media to bridge...`);
+              console.log(`[Periodic Check] Bridge ${dialBridge.id} has channels:`, bridgeInfo.channels || []);
+              console.log(`[Periodic Check] Attempting to add external media to bridge...`);
               
               try {
                 const bridgeObj = await ariClient.bridges.get({ bridgeId: dialBridge.id });
@@ -1296,16 +1320,20 @@ async function connectARI() {
                 console.log(`[Periodic Check] Bridge ${dialBridge.id} now has channels:`, verifyBridge.channels || []);
                 console.log(`[Periodic Check] Expected: Both SIP channels + External media = 3 channels`);
               } catch (addErr) {
-                console.error(`[Periodic Check] Error adding external media to bridge:`, addErr.message || addErr);
-                if (addErr.message && addErr.message.includes('not in Stasis')) {
-                  console.error(`[Periodic Check] ⚠ Bridge ${dialBridge.id} is not in Stasis - this is Dial()'s bridge`);
-                  console.error(`[Periodic Check] ⚠ Cannot add channels to Dial()'s bridge via ARI - this is a limitation`);
+                const errorMsg = addErr.message || JSON.stringify(addErr);
+                console.error(`[Periodic Check] ❌ ERROR adding external media to bridge:`, errorMsg);
+                if (errorMsg.includes('not in Stasis') || errorMsg.includes('Stasis')) {
+                  console.error(`[Periodic Check] ⚠ CRITICAL: Bridge ${dialBridge.id} is NOT in Stasis application`);
+                  console.error(`[Periodic Check] ⚠ This means we CANNOT add channels to Dial()'s bridge via ARI`);
+                  console.error(`[Periodic Check] ⚠ This is an Asterisk limitation - Dial() bridges are not in Stasis`);
                 }
               }
             } else {
-              // External media is already in the correct bridge
-              if (session.packetCount % 500 === 0) { // Log every 500 packets to avoid spam
-                console.log(`[Periodic Check] ✓ External media ${channelInfo.externalMediaId} is correctly in bridge ${dialBridge.id}`);
+              // External media is already in the correct bridge - log success once
+              if (!session.extMediaAddedLogged) {
+                console.log(`[Periodic Check] ✓✓✓ External media ${channelInfo.externalMediaId} is correctly in bridge ${dialBridge.id} ✓✓✓`);
+                console.log(`[Periodic Check] Bridge ${dialBridge.id} has ${bridgeInfo.channels.length} channels:`, bridgeInfo.channels || []);
+                session.extMediaAddedLogged = true;
               }
             }
           } else {
